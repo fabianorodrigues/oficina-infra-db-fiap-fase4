@@ -1,0 +1,298 @@
+name: Database Bootstrap Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Digite BOOTSTRAP para confirmar a execucao do bootstrap dos bancos.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: database-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    name: Bootstrap SQL databases via Kubernetes Job
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      SQL_TOOLS_IMAGE: ${{ vars.SQL_TOOLS_IMAGE }}
+      NAMESPACE: oficina
+    steps:
+      # 1. Checkout
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Branch
+      - name: Validate branch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REF -ne 'refs/heads/main') {
+            throw 'Este workflow deve ser executado somente na branch main.'
+          }
+
+      # 3. Confirmacao
+      - name: Validate confirmation
+        shell: pwsh
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:CONFIRMATION -cne 'BOOTSTRAP') {
+            throw 'Confirmacao invalida. Digite exatamente BOOTSTRAP.'
+          }
+
+      # 4 e 5. Repository Variables obrigatorias
+      - name: Validate repository variables
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:AWS_REGION)) { throw 'Repository Variable obrigatoria vazia: AWS_REGION' }
+          if ([string]::IsNullOrWhiteSpace($env:SQL_TOOLS_IMAGE)) { throw 'Repository Variable obrigatoria vazia: SQL_TOOLS_IMAGE' }
+          if ($env:SQL_TOOLS_IMAGE -notmatch ':' -or $env:SQL_TOOLS_IMAGE -match ':latest$') {
+            throw 'SQL_TOOLS_IMAGE deve ter tag/digest explicito e nunca :latest.'
+          }
+
+      # 8. Contratos locais (antes de qualquer chamada AWS)
+      - name: Validate local contracts
+        shell: pwsh
+        run: |
+          ./scripts/validate-database-secrets-config.ps1 -ConfigPath config/database-secrets.json
+          ./scripts/validate-database-bootstrap-config.ps1 -ConfigPath config/database-bootstrap.json -SecretsConfigPath config/database-secrets.json
+
+      # 6. Credenciais AWS
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # 7. STS
+      - name: Validate AWS identity
+        shell: pwsh
+        run: aws sts get-caller-identity
+
+      # 9-14. Prechecks AWS: SSM, master secret e sete secrets com AWSCURRENT
+      - name: Resolve SSM parameters and master secret
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Get-Ssm([string]$name) {
+            $v = aws ssm get-parameter --name $name --region $env:AWS_REGION --query 'Parameter.Value' --output text
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($v) -or $v -eq 'None') {
+              throw "Parametro SSM ausente ou vazio: $name"
+            }
+            return $v.Trim()
+          }
+          $clusterName   = Get-Ssm '/oficina/infra/cluster/name'
+          $rdsHost       = Get-Ssm '/oficina/infra/rds/endpoint'
+          $rdsPort       = Get-Ssm '/oficina/infra/rds/port'
+          $masterArn     = Get-Ssm '/oficina/infra/rds/master-secret-arn'
+
+          if ($rdsPort -notmatch '^\d+$') { throw "Porta do RDS invalida no SSM: $rdsPort" }
+
+          # 14. Master secret existe (describe-secret, sem ler o valor).
+          aws secretsmanager describe-secret --secret-id $masterArn --region $env:AWS_REGION --output json | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Master secret ausente no Secrets Manager.' }
+
+          "CLUSTER_NAME=$clusterName"      | Add-Content -Path $env:GITHUB_ENV
+          "RDS_HOST=$rdsHost"              | Add-Content -Path $env:GITHUB_ENV
+          "RDS_PORT=$rdsPort"              | Add-Content -Path $env:GITHUB_ENV
+          "MASTER_SECRET_ARN=$masterArn"   | Add-Content -Path $env:GITHUB_ENV
+          Write-Host "Cluster: $clusterName | RDS: ${rdsHost}:$rdsPort | master secret: OK"
+
+      # 12-13. Sete containers de secrets com versao AWSCURRENT
+      - name: Validate SQL secret containers (AWSCURRENT)
+        shell: pwsh
+        run: ./scripts/validate-database-secret-containers.ps1 -ConfigPath config/database-secrets.json -Region $env:AWS_REGION -RequireCurrentVersion $true
+
+      # 15. kubeconfig
+      - name: Update kubeconfig
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+
+      # 16-21. Prechecks do cluster
+      - name: Validate cluster prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "16. Namespace $NAMESPACE"
+          kubectl get namespace "$NAMESPACE" >/dev/null
+
+          echo "17. Nodes Ready"
+          ready=$(kubectl get nodes -o jsonpath='{range .items[*]}{range .status.conditions[?(@.type=="Ready")]}{.status}{"\n"}{end}{end}' | grep -c '^True' || true)
+          if [ "${ready:-0}" -lt 1 ]; then echo "Nenhum node Ready." >&2; exit 1; fi
+          echo "Nodes Ready: $ready"
+
+          echo "18. Secrets Store CSI Driver"
+          kubectl get csidriver secrets-store.csi.k8s.io >/dev/null
+
+          echo "19. AWS Secrets and Configuration Provider (ASCP)"
+          if ! kubectl get daemonset -n kube-system -l app=secrets-store-csi-driver-provider-aws 2>/dev/null | grep -q .; then
+            if ! kubectl get pods -n kube-system -l app.kubernetes.io/name=secrets-store-csi-driver-provider-aws 2>/dev/null | grep -q .; then
+              echo "ASCP nao encontrado em kube-system." >&2
+              exit 1
+            fi
+          fi
+
+          echo "20. Identidade db-bootstrap"
+          kubectl get serviceaccount db-bootstrap -n "$NAMESPACE" >/dev/null
+
+          echo "21. Acesso de rede planejado ao RDS (informativo)"
+          rds_sg=$(aws ssm get-parameter --name /oficina/infra/rds/security-group-id --region "$AWS_REGION" --query 'Parameter.Value' --output text)
+          echo "RDS Security Group: $rds_sg (conectividade efetiva validada pelo proprio Job)"
+
+      # 22. ConfigMap dos scripts (gerado pela pipeline, sem duplicacao)
+      - name: Generate scripts ConfigMap
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p rendered
+          kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/bootstrap > rendered/configmap.yaml
+          if grep -Eiq 'secret_?string|-----BEGIN|AKIA[0-9A-Z]{16}' rendered/configmap.yaml; then
+            echo "ConfigMap contem conteudo sensivel." >&2
+            exit 1
+          fi
+
+      # 23. Renderizacao dos manifests com valores reais (nao sensiveis + ARN)
+      - name: Render manifests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $jobName = "oficina-db-bootstrap-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)"
+          "JOB_NAME=$jobName" | Add-Content -Path $env:GITHUB_ENV
+          ./scripts/render-database-bootstrap-manifests.ps1 `
+            -ConfigPath config/database-bootstrap.json `
+            -TemplateDirectory deploy/bootstrap `
+            -OutputDirectory rendered `
+            -JobName $jobName `
+            -MasterSecretArn $env:MASTER_SECRET_ARN `
+            -Region $env:AWS_REGION `
+            -SqlToolsImage $env:SQL_TOOLS_IMAGE `
+            -WorkloadIdentityMode 'pod-identity' `
+            -RdsHost $env:RDS_HOST `
+            -RdsPort $env:RDS_PORT
+
+      # 24. Validacao Kubernetes dos manifests renderizados
+      - name: Install kubeconform
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="v0.6.7"
+          curl -sSL "https://github.com/yannh/kubeconform/releases/download/${version}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin kubeconform
+
+      - name: Validate rendered manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubeconform -strict -ignore-missing-schemas -summary \
+            rendered/service-account.yaml \
+            rendered/secret-provider-class.yaml \
+            rendered/job.yaml \
+            rendered/configmap.yaml
+
+      # 25-28. Aplicacao (ServiceAccount, SecretProviderClass, ConfigMap, Job)
+      - name: Apply manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl apply -f rendered/service-account.yaml
+          kubectl apply -f rendered/secret-provider-class.yaml
+          kubectl apply -f rendered/configmap.yaml
+          kubectl apply -f rendered/job.yaml
+
+      # 29. Aguardar conclusao
+      - name: Wait for Job completion
+        shell: bash
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 1000))
+          result="timeout"
+          while [ $SECONDS -lt $deadline ]; do
+            succeeded=$(kubectl get job "$JOB_NAME" -n "$NAMESPACE" -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "")
+            failed=$(kubectl get job "$JOB_NAME" -n "$NAMESPACE" -o jsonpath='{.status.failed}' 2>/dev/null || echo "")
+            if [ "${succeeded:-0}" = "1" ]; then result="complete"; break; fi
+            if [ -n "${failed:-}" ] && [ "${failed:-0}" != "0" ]; then result="failed"; break; fi
+            sleep 10
+          done
+          echo "JOB_RESULT=$result" >> "$GITHUB_ENV"
+          echo "Resultado do Job: $result"
+
+      # 30. Capturar logs sanitizados
+      - name: Capture sanitized logs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl logs "job/$JOB_NAME" -n "$NAMESPACE" --all-containers=true > rendered/job.log 2>/dev/null || true
+          if grep -Eiq 'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|-----BEGIN|server=tcp:|password=[^ ]' rendered/job.log; then
+            echo "Possivel vazamento de secret nos logs. Conteudo nao sera exibido." >&2
+            exit 1
+          fi
+          echo "----- Logs sanitizados do Job -----"
+          tail -n 60 rendered/job.log || true
+
+      # 31. Falhar se o Job falhou
+      - name: Fail if Job did not complete
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${JOB_RESULT:-}" != "complete" ]; then
+            echo "Job nao concluiu com sucesso (resultado: ${JOB_RESULT:-desconhecido})." >&2
+            kubectl describe job "$JOB_NAME" -n "$NAMESPACE" || true
+            exit 1
+          fi
+
+      # 32. Validacao read-only pos-execucao
+      - name: Read-only post-execution validation
+        shell: pwsh
+        run: |
+          ./scripts/validate-database-bootstrap.ps1 -Namespace $env:NAMESPACE -JobName $env:JOB_NAME -AwsRegion $env:AWS_REGION
+
+      # 33. Step Summary sanitizado
+      - name: Publish sanitized summary
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $config = Get-Content -LiteralPath 'config/database-bootstrap.json' -Raw | ConvertFrom-Json
+          $dbs = @($config.databases | ForEach-Object { $_.name })
+          $logins = @()
+          foreach ($d in $config.databases) {
+            $logins += $d.runtimeLogin; $logins += $d.migratorLogin
+            foreach ($r in $d.readOnlyLogins) { $logins += $r }
+          }
+          $secrets = @($config.secrets.PSObject.Properties | ForEach-Object { $_.Value })
+          $lines = @()
+          $lines += '## Database Bootstrap Deploy'
+          $lines += ''
+          $lines += "Cluster: $env:CLUSTER_NAME"
+          $lines += "Namespace: $env:NAMESPACE"
+          $lines += "Job: $env:JOB_NAME"
+          $lines += "Resultado do Job: $($env:JOB_RESULT)"
+          $lines += ''
+          $lines += 'Bancos esperados:'
+          foreach ($d in $dbs) { $lines += "- $d" }
+          $lines += ''
+          $lines += 'Logins esperados:'
+          foreach ($l in $logins) { $lines += "- $l" }
+          $lines += ''
+          $lines += 'Secrets validados (por nome):'
+          foreach ($s in $secrets) { $lines += "- $s" }
+          $lines += ''
+          $lines += 'Validacao SQL: executada pelo Job (bootstrap + validate).'
+          $lines += 'Nenhum valor sensivel exibido.'
+          ($lines -join "`n") | Add-Content -Path $env:GITHUB_STEP_SUMMARY

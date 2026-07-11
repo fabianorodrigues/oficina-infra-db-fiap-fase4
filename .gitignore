@@ -53,3 +53,12 @@ terraform.rc
 .secrets-tmp/
 *.secret-payload.json
 database-secrets.local.json
+
+# Database bootstrap: manifests renderizados, ConfigMap gerado e logs do Job
+# sao artefatos efemeros da pipeline; nunca versionar.
+rendered/
+*.rendered.sql
+*.rendered.yaml
+job.log
+kubeconfig
+

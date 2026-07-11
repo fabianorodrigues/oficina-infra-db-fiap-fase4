@@ -4,6 +4,7 @@ Infraestrutura Terraform da Fase 4 para backend de state e stack de banco de dad
 
 - Backend Terraform: [terraform/backend/README.md](terraform/backend/README.md)
 - Infra DB: [terraform/infra-db/README.md](terraform/infra-db/README.md)
+- Bootstrap dos bancos: [deploy/bootstrap/README.md](deploy/bootstrap/README.md)
 
 ## Sincronizacao centralizada dos secrets SQL
 
@@ -148,3 +149,48 @@ Auth CPF le         /oficina/auth/database
 - Payload temporario criado no diretorio temporario do sistema, com permissao
   restritiva quando suportada, e removido no bloco `finally`.
 - Reexecucao idempotente via `ClientRequestToken`.
+
+## Bootstrap estrutural dos bancos
+
+Depois de Infra DB, Platform, EKS e Secrets Sync, o bootstrap idempotente cria
+os tres bancos, os sete logins/usuarios e as permissoes minimas por meio de um
+Kubernetes Job (`db-bootstrap`) que consome o master secret e os sete secrets
+SQL via Secrets Store CSI Driver + ASCP. Detalhes e execucao futura:
+[deploy/bootstrap/README.md](deploy/bootstrap/README.md).
+
+### Componentes
+
+```text
+config/database-bootstrap.json          Contrato nao sensivel do bootstrap
+scripts/bootstrap-databases.sql          T-SQL idempotente (bancos/logins/usuarios/permissoes)
+scripts/validate-databases.sql           Validacao T-SQL read-only
+scripts/run-database-bootstrap.sh        Runner do Job (escape T-SQL, render, sqlcmd)
+scripts/render-database-bootstrap-manifests.ps1  Renderer dos manifests
+scripts/validate-database-bootstrap-config.ps1   Validacao offline do contrato
+scripts/validate-database-bootstrap.ps1  Validacao read-only pos-execucao
+deploy/bootstrap/                        ServiceAccount, SecretProviderClass, Job, kustomization
+.github/workflows/database-bootstrap-ci.yml      CI estatica (sem AWS)
+.github/workflows/database-bootstrap-deploy.yml  Deploy manual (main + BOOTSTRAP)
+```
+
+### Matriz de bancos, logins e permissoes
+
+| Banco | Runtime (datareader+datawriter+EXECUTE) | Migrator (+db_ddladmin) | Read-only |
+| ----- | --------------------------------------- | ----------------------- | --------- |
+| OficinaCadastroDb | cadastro_app | cadastro_migrator | auth_read (role `auth_reader`) |
+| OficinaEstoqueDb | estoque_app | estoque_migrator | - |
+| OficinaOrdensServicoDb | ordens_app | ordens_migrator | - |
+
+Runtime nunca recebe DDL; migrator nunca recebe `db_owner`; `auth_read` existe
+somente no Cadastro. A ampliacao de permissao do migrator (alem de `db_ddladmin`)
+so deve ocorrer apos erro real de migration do EF, nunca preventivamente.
+
+### Configuracao do workflow de deploy
+
+```text
+Repository Secrets:  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
+Repository Variables: AWS_REGION, SQL_TOOLS_IMAGE
+```
+
+Nenhuma password SQL vira Repository Secret nesta etapa: elas ja pertencem ao
+fluxo centralizado da Etapa 7 e vivem no Secrets Manager.
