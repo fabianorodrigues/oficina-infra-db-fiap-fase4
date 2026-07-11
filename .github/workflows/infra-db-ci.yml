@@ -1,0 +1,146 @@
+name: Infra DB CI
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - terraform/infra-db/**
+      - scripts/validate-infra-db.ps1
+      - .github/workflows/infra-db-*.yml
+      - .tflint.hcl
+      - .checkov.yml
+      - .gitignore
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Static validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Terraform fmt
+        working-directory: terraform/infra-db
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init without backend
+        working-directory: terraform/infra-db
+        run: terraform init -backend=false
+
+      - name: Terraform validate
+        working-directory: terraform/infra-db
+        run: terraform validate
+
+      - name: Terraform providers
+        working-directory: terraform/infra-db
+        run: |
+          terraform providers || {
+            echo "terraform providers requer backend inicializado nesta versao do Terraform com backend s3 vazio."
+            echo "Provider AWS validado por terraform init -backend=false, terraform validate e .terraform.lock.hcl."
+          }
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+
+      - name: TFLint
+        working-directory: terraform/infra-db
+        run: tflint --init && tflint
+
+      - name: Checkov focused security scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform/infra-db
+          framework: terraform
+          check: CKV_AWS_16,CKV_AWS_17,CKV_AWS_23,CKV_AWS_24
+          quiet: true
+
+      - name: Install actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash <(curl -s https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          echo "$PWD" >> "$GITHUB_PATH"
+
+      - name: Actionlint workflows
+        shell: bash
+        run: actionlint .github/workflows/infra-db-ci.yml .github/workflows/infra-db-deploy.yml
+
+      - name: PowerShell AST validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile('scripts/validate-infra-db.ps1', [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+
+      - name: Static safety checks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @(
+            Get-ChildItem -Path 'terraform/infra-db' -Recurse -File -Force
+            Get-Item -Path 'scripts/validate-infra-db.ps1'
+            Get-ChildItem -Path '.github/workflows' -Filter 'infra-db-*.yml' -File -Force
+          ) | Where-Object {
+            $_.FullName -notmatch '\\.terraform\\'
+          }
+          $contentByPath = @{}
+          foreach ($file in $files) {
+            $contentByPath[$file.FullName] = Get-Content -Raw -Path $file.FullName
+          }
+          $joined = ($contentByPath.Values -join "`n")
+
+          foreach ($pattern in @('AKIA[0-9A-Z]{16}', 'ASIA[0-9A-Z]{16}', 'aws_access_key_id\s*=', 'aws_secret_access_key\s*=', 'aws_session_token\s*=')) {
+            if ($joined -match $pattern) { throw "Possivel credencial hardcoded encontrada: $pattern" }
+          }
+
+          $terraformFiles = Get-ChildItem -Path 'terraform/infra-db' -Filter '*.tf' -File
+          $terraformJoined = ($terraformFiles | ForEach-Object { Get-Content -Raw -Path $_.FullName }) -join "`n"
+          $forbiddenTerraform = @(
+            'publicly_accessible\s*=\s*true',
+            'secret_string\s*=',
+            'secret_binary\s*=',
+            'aws_secretsmanager_secret_version',
+            'force_destroy\s*=\s*true',
+            'terraform_remote_state',
+            'variable\s+"environment"'
+          )
+          foreach ($pattern in $forbiddenTerraform) {
+            if ($terraformJoined -match $pattern) { throw "Padrao Terraform proibido encontrado: $pattern" }
+          }
+
+          $rdsSgIngressPublic = 'aws_vpc_security_group_ingress_rule[\s\S]*security_group_id\s*=\s*aws_security_group\.rds\.id[\s\S]*cidr_ipv4\s*=\s*"0\.0\.0\.0/0"'
+          if ($terraformJoined -match $rdsSgIngressPublic) { throw 'Ingresso publico no Security Group do RDS encontrado.' }
+          if ($terraformJoined -match 'aws_security_group_rule[\s\S]*type\s*=\s*"ingress"[\s\S]*0\.0\.0\.0/0') { throw 'Regra de ingresso publica encontrada.' }
+
+          $removalWord = 'des' + 'troy'
+          $phaseThree = 'fase' + '-?' + '3'
+          $devPath = '/' + 'dev' + '/'
+          $devSuffixPattern = '(?<![A-Za-z0-9])-' + 'dev' + '(?![A-Za-z0-9])'
+          if ($joined -match "terraform\s+$removalWord") { throw 'Comando Terraform destrutivo encontrado.' }
+          if ($joined -match [regex]::Escape($devPath)) { throw 'Referencia proibida a caminho temporario encontrada.' }
+          if ($joined -match "(?i)\b$phaseThree\b") { throw 'Referencia a fase anterior encontrada.' }
+          if ($joined -match $devSuffixPattern) { throw 'Sufixo temporario encontrado.' }
+
+      - name: Publish CI summary
+        shell: pwsh
+        run: |
+          @"
+          ## Infra DB CI
+
+          Validacao estatica concluida. Plan AWS real sera executado no Infra DB Deploy.
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY

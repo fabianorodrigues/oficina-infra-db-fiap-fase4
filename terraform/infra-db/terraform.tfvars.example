@@ -1,0 +1,10 @@
+aws_region            = "REPLACE_WITH_AWS_REGION"
+project_name          = "oficina"
+vpc_cidr              = "10.40.0.0/16"
+rds_identifier        = "oficina-sqlserver"
+rds_engine            = "sqlserver-ex"
+rds_instance_class    = "db.t3.micro"
+rds_allocated_storage = 20
+rds_storage_type      = "gp3"
+rds_port              = 1433
+rds_master_username   = "oficina_admin"
