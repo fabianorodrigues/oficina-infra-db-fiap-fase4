@@ -47,3 +47,9 @@ terraform.rc
 # Uncomment the line below if you want to ignore planout files.
 # planout
 /.vs
+
+# Database secrets sync: temporary payloads must never be committed.
+# The sync script uses the system temp directory, never a repository folder.
+.secrets-tmp/
+*.secret-payload.json
+database-secrets.local.json
