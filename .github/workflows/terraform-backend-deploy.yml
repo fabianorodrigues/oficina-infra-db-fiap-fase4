@@ -1,0 +1,120 @@
+name: Terraform Backend Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Digite CREATE para confirmar a criacao ou reconciliacao do backend Terraform.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-backend
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Create or reconcile Terraform backend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate branch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REF -ne 'refs/heads/main') {
+            throw 'Este workflow deve ser executado somente na branch main.'
+          }
+
+      - name: Validate confirmation
+        shell: pwsh
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:CONFIRMATION -cne 'CREATE') {
+            throw 'Confirmacao invalida. Digite exatamente CREATE.'
+          }
+
+      - name: Validate repository variables
+        shell: pwsh
+        env:
+          AWS_REGION_VALUE: ${{ vars.AWS_REGION }}
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          TF_STATE_REGION: ${{ vars.TF_STATE_REGION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @('AWS_REGION_VALUE', 'TF_STATE_BUCKET', 'TF_STATE_REGION')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Repository Variable obrigatoria vazia: $name"
+            }
+          }
+          if ($env:AWS_REGION_VALUE -ne $env:TF_STATE_REGION) {
+            throw 'AWS_REGION e TF_STATE_REGION devem ter o mesmo valor.'
+          }
+          ./scripts/create-terraform-backend.ps1 -BucketName $env:TF_STATE_BUCKET -Region $env:TF_STATE_REGION -DryRun
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Validate AWS identity
+        shell: pwsh
+        run: aws sts get-caller-identity
+
+      - name: Create or reconcile backend bucket
+        shell: pwsh
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          TF_STATE_REGION: ${{ vars.TF_STATE_REGION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/create-terraform-backend.ps1 -BucketName $env:TF_STATE_BUCKET -Region $env:TF_STATE_REGION
+
+      - name: Validate backend bucket
+        shell: pwsh
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          TF_STATE_REGION: ${{ vars.TF_STATE_REGION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/validate-terraform-backend.ps1 -BucketName $env:TF_STATE_BUCKET -Region $env:TF_STATE_REGION
+
+      - name: Publish summary
+        shell: pwsh
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          TF_STATE_REGION: ${{ vars.TF_STATE_REGION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $identity = aws sts get-caller-identity --output json | ConvertFrom-Json
+          @"
+          ## Terraform Backend
+
+          | Item | Valor |
+          | --- | --- |
+          | Bucket | $env:TF_STATE_BUCKET |
+          | Regiao | $env:TF_STATE_REGION |
+          | Account ID | $($identity.Account) |
+          | Versionamento | Enabled |
+          | Criptografia | SSE-S3 AES256 |
+          | Public Access Block | true |
+          | Object Ownership | BucketOwnerEnforced |
+          | Tags | Project, Purpose, ManagedBy, AcademicProject |
+          | Status final | OK |
+
+          ## Chaves futuras dos states
+
+          - oficina/infra-db/terraform.tfstate
+          - oficina/platform/terraform.tfstate
+          - oficina/entrypoint/terraform.tfstate
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY
