@@ -285,5 +285,5 @@ jobs:
           - Inspecao estatica dos scripts SQL
           - Buscas por secrets, comandos proibidos e referencias de ambiente
 
-          A execucao real do Job ocorre somente no Database Bootstrap Deploy.
+          A execucao real do Job ocorre somente no Database Bootstrap.
           "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY

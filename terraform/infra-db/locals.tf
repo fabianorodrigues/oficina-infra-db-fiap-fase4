@@ -2,10 +2,9 @@ locals {
   repository_name = "oficina-infra-db-fiap-fase4"
 
   base_tags = {
-    Project         = var.project_name
-    AcademicProject = "fiap-fase4"
-    ManagedBy       = "terraform"
-    Repository      = local.repository_name
+    Project    = var.project_name
+    ManagedBy  = "terraform"
+    Repository = local.repository_name
   }
 
   common_tags = merge(local.base_tags, var.common_tags)

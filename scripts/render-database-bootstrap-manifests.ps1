@@ -50,7 +50,7 @@
 
 .PARAMETER SqlEncryptTrustServerCert
     'true'/'false'. Encriptacao sempre ligada; controla apenas a validacao do
-    certificado do servidor. Padrao 'true' (simplificacao academica documentada).
+    certificado do servidor. Padrao 'true', pois o RDS usa certificado gerenciado pela AWS.
 #>
 
 [CmdletBinding()]

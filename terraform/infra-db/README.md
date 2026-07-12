@@ -81,7 +81,7 @@ VPC_CIDR=10.40.0.0/16
 RDS_DATABASE_PORT=1433
 ```
 
-Opcionais, somente se o AWS Academy nao aceitar os defaults:
+Opcionais, somente se a conta AWS nao aceitar os defaults:
 
 ```text
 RDS_ENGINE
@@ -131,7 +131,7 @@ Validacoes esperadas:
 Depois da execucao, a validacao pode ser repetida com:
 
 ```powershell
-./scripts/validate-infra-db.ps1 -Region <regiao-do-academy>
+./scripts/validate-infra-db.ps1 -Region <regiao-da-conta-aws>
 ```
 
 ## Proxima etapa
@@ -154,11 +154,11 @@ Database Bootstrap
 
 Essas etapas criarao os bancos logicos, usuarios SQL e valores funcionais de secrets.
 
-## AWS Academy indisponivel
+## Validação sem acesso à AWS
 
-Esta implementacao pode ser validada estaticamente sem acesso ao AWS Academy. O primeiro `terraform plan` real e o primeiro `terraform apply` real devem ocorrer somente pelo workflow manual `Infra DB Deploy`, na branch `main`, depois do retorno do acesso ao Academy.
+Esta implementacao pode ser validada estaticamente sem acesso a AWS. O primeiro `terraform plan` real e o primeiro `terraform apply` real devem ocorrer somente pelo workflow manual `Infra DB Deploy`, na branch `main`.
 
-Validacoes AWS pendentes ate o retorno do acesso:
+Validacoes AWS pendentes ate a primeira execucao real:
 
 - autenticacao STS;
 - permissoes IAM;

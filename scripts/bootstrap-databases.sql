@@ -200,7 +200,7 @@ IF IS_ROLEMEMBER('auth_reader', 'auth_read') = 0 ALTER ROLE [auth_reader] ADD ME
 
 -- Estrategia de leitura, idempotente mesmo antes das migrations do Cadastro:
 --   preferencia 1: schema de autenticacao dedicado (GRANT SELECT ON SCHEMA::auth)
---   fallback  academico documentado: db_datareader (leitura em todo o banco)
+--   fallback documentado: db_datareader (leitura em todo o banco)
 IF EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'auth')
     GRANT SELECT ON SCHEMA::[auth] TO [auth_reader];
 ELSE IF IS_ROLEMEMBER('db_datareader', 'auth_reader') = 0

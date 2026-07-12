@@ -1,5 +1,5 @@
 variable "aws_region" {
-  description = "AWS region used by the FIAP Academy account."
+  description = "AWS region used by the target account."
   type        = string
 
   validation {
@@ -31,7 +31,7 @@ variable "vpc_cidr" {
 }
 
 variable "availability_zone_count" {
-  description = "Number of Availability Zones used by this academic stack."
+  description = "Number of Availability Zones used by this stack."
   type        = number
   default     = 2
 
@@ -53,7 +53,7 @@ variable "rds_identifier" {
 }
 
 variable "rds_engine" {
-  description = "RDS SQL Server engine edition. The default is small and academic; confirm availability in AWS Academy during the first real plan."
+  description = "RDS SQL Server engine edition. The default is a small edition; confirm availability during the first real plan."
   type        = string
   default     = "sqlserver-ex"
 
@@ -64,7 +64,7 @@ variable "rds_engine" {
 }
 
 variable "rds_instance_class" {
-  description = "RDS instance class. The default must be validated in AWS Academy."
+  description = "RDS instance class. The default must be validated during the first real plan."
   type        = string
   default     = "db.t3.micro"
 

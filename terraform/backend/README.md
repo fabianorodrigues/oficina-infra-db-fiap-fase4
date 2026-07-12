@@ -1,6 +1,6 @@
 # Terraform Backend
 
-Este backend armazena os Terraform States independentes da Fase 4. Ele nao reutiliza bucket, state ou recursos da Fase 3.
+Este backend armazena os Terraform States da solução Oficina, de forma independente de qualquer bucket, state ou recurso pré-existente.
 
 ## Repository Secrets
 
@@ -42,7 +42,7 @@ TF_STATE_BUCKET
 TF_STATE_REGION
 ```
 
-`AWS_REGION` deve ser a regiao utilizada pelo AWS Academy. `TF_STATE_REGION` deve ter o mesmo valor. `TF_STATE_BUCKET` deve ser globalmente unico.
+`AWS_REGION` deve ser a regiao da conta AWS utilizada. `TF_STATE_REGION` deve ter o mesmo valor. `TF_STATE_BUCKET` deve ser globalmente unico.
 
 Formato sugerido para o bucket:
 
@@ -50,7 +50,7 @@ Formato sugerido para o bucket:
 oficina-terraform-state-<ACCOUNT_ID>-<REGIAO>
 ```
 
-Para obter o Account ID, inicie o AWS Academy, configure as credenciais temporarias localmente se necessario e execute:
+Para obter o Account ID, configure as credenciais temporarias localmente e execute:
 
 ```powershell
 aws sts get-caller-identity
@@ -104,6 +104,6 @@ use_lockfile = true
 
 Esse locking nativo do backend S3 deve ser confirmado contra a versao minima do Terraform adotada pelas stacks futuras. Se a versao escolhida nao suportar `use_lockfile`, registre a incompatibilidade antes das proximas stacks. Nao crie tabela DynamoDB automaticamente nesta etapa.
 
-## Reset do AWS Academy
+## Limpeza
 
-Nao existe pipeline de destroy e nao existe script para excluir o bucket. A limpeza integral sera feita pelo reset do AWS Academy. Salve as evidencias antes do reset. Depois do reset, recrie o backend antes de executar as demais stacks.
+Nao existe pipeline de destroy e nao existe script para excluir o bucket neste repositorio.

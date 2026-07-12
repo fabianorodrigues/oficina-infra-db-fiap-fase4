@@ -109,7 +109,7 @@ jobs:
           | Criptografia | SSE-S3 AES256 |
           | Public Access Block | true |
           | Object Ownership | BucketOwnerEnforced |
-          | Tags | Project, Purpose, ManagedBy, AcademicProject |
+          | Tags | Project, Purpose, ManagedBy |
           | Status final | OK |
 
           ## Chaves futuras dos states

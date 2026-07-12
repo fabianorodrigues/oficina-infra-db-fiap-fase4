@@ -12,10 +12,9 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $RequiredTags = [ordered]@{
-    Project         = 'oficina'
-    Purpose         = 'terraform-state'
-    ManagedBy       = 'github-actions'
-    AcademicProject = 'fiap-fase4'
+    Project   = 'oficina'
+    Purpose   = 'terraform-state'
+    ManagedBy = 'github-actions'
 }
 
 function Invoke-AwsReadOnly {

@@ -1,4 +1,4 @@
-name: Database Bootstrap Deploy
+name: Database Bootstrap
 
 on:
   workflow_dispatch:
@@ -277,7 +277,7 @@ jobs:
           }
           $secrets = @($config.secrets.PSObject.Properties | ForEach-Object { $_.Value })
           $lines = @()
-          $lines += '## Database Bootstrap Deploy'
+          $lines += '## Database Bootstrap'
           $lines += ''
           $lines += "Cluster: $env:CLUSTER_NAME"
           $lines += "Namespace: $env:NAMESPACE"

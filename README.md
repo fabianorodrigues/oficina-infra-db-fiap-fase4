@@ -1,6 +1,13 @@
 # oficina-infra-db-fiap-fase4
 
-Infraestrutura Terraform da Fase 4 para backend de state e stack de banco de dados da Oficina.
+## Responsabilidade
+
+Provisiona a rede e a camada de dados da solução Oficina: VPC independente,
+subnets, RDS SQL Server, backend remoto do Terraform e o bootstrap idempotente
+dos três bancos lógicos (`OficinaCadastroDb`, `OficinaEstoqueDb`,
+`OficinaOrdensServicoDb`) com seus logins e usuários. É o primeiro repositório
+provisionado na sequência descrita no README de
+[oficina-infra-fiap-fase4](../oficina-infra-fiap-fase4/README.md#ordem-de-provisionamento).
 
 - Backend Terraform: [terraform/backend/README.md](terraform/backend/README.md)
 - Infra DB: [terraform/infra-db/README.md](terraform/infra-db/README.md)
@@ -41,7 +48,7 @@ SQL_ORDENS_MIGRATOR_PASSWORD
 SQL_AUTH_READ_PASSWORD
 ```
 
-Credenciais temporarias do AWS Academy (necessarias antes de acessar a AWS):
+Credenciais temporarias da AWS (necessarias antes de acessar a AWS):
 
 ```text
 AWS_ACCESS_KEY_ID
@@ -125,7 +132,7 @@ connection strings e artefatos temporarios.
 Infra DB provisionada
 Containers de Secrets Manager existentes
 Parametros SSM de endpoint (/oficina/infra/rds/endpoint) e porta (/oficina/infra/rds/port)
-Credenciais AWS Academy validas
+Credenciais AWS validas
 ```
 
 ### Consumidores
@@ -194,3 +201,10 @@ Repository Variables: AWS_REGION, SQL_TOOLS_IMAGE
 
 Nenhuma password SQL vira Repository Secret nesta etapa: elas ja pertencem ao
 fluxo centralizado da Etapa 7 e vivem no Secrets Manager.
+
+## Próximo componente
+
+Depois de `Backend Bootstrap`, `Infra DB Deploy`, `Database Secrets Sync` e
+`Database Bootstrap`, siga para
+[oficina-infra-fiap-fase4](../oficina-infra-fiap-fase4/README.md) para
+provisionar a plataforma (EKS, ECR, SQS) e o ponto de entrada público.
