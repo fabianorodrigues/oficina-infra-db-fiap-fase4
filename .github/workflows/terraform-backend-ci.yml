@@ -116,8 +116,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          cd "$RUNNER_TEMP/actionlint"
           bash <(curl -s https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
-          echo "$PWD" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
 
       - name: Actionlint workflows
         shell: bash
@@ -128,7 +130,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $files = Get-ChildItem -Recurse -File -Force |
-            Where-Object { $_.FullName -notmatch '\\.git\\' -and $_.FullName -notmatch '\\.vs\\' }
+            Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' -and $_.FullName -notmatch '[\\/]\.vs[\\/]' }
           $content = $files | ForEach-Object { Get-Content -Raw -Path $_.FullName }
           $joined = $content -join "`n"
 
@@ -155,13 +157,13 @@ jobs:
 
           $ci = Get-Content -Raw -Path '.github/workflows/terraform-backend-ci.yml'
           $forbiddenCi = @(
-            'aws s3api create' + '-bucket',
-            'aws s3api ' + 'put-',
-            'aws create' + '-',
-            'aws update' + '-',
-            'aws delete' + '-',
-            'terraform app' + 'ly',
-            'terraform des' + 'troy'
+            ('aws s3api create' + '-bucket'),
+            ('aws s3api ' + 'put-'),
+            ('aws create' + '-'),
+            ('aws update' + '-'),
+            ('aws delete' + '-'),
+            ('terraform app' + 'ly'),
+            ('terraform des' + 'troy')
           )
           foreach ($item in $forbiddenCi) {
             if ($ci -match [regex]::Escape($item)) {

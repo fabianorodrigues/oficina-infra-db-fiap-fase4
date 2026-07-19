@@ -73,8 +73,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          cd "$RUNNER_TEMP/actionlint"
           bash <(curl -s https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
-          echo "$PWD" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
 
       - name: Actionlint workflows
         shell: bash
@@ -194,7 +196,7 @@ jobs:
             'secret_string\s*=',
             'secret_binary\s*=',
             'aws_secretsmanager_secret_version',
-            'force_destroy\s*=\s*true',
+            ('force_' + 'destroy\s*=\s*true'),
             'terraform_remote_state',
             'variable\s+"environment"'
           )

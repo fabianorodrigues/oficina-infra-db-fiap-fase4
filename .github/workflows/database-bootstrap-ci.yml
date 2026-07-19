@@ -154,16 +154,18 @@ jobs:
         run: |
           set -euo pipefail
           # CRD (SecretProviderClass) e pulada: nao ha cluster para descoberta de tipo.
-          kubectl apply --dry-run=client -f "$RENDER_OUTPUT/service-account.yaml"
-          kubectl apply --dry-run=client -f "$RENDER_OUTPUT/configmap.yaml"
-          kubectl apply --dry-run=client -f "$RENDER_OUTPUT/job.yaml"
+          kubectl apply --dry-run=client --validate=false -f "$RENDER_OUTPUT/service-account.yaml"
+          kubectl apply --dry-run=client --validate=false -f "$RENDER_OUTPUT/configmap.yaml"
+          kubectl apply --dry-run=client --validate=false -f "$RENDER_OUTPUT/job.yaml"
 
       - name: Install actionlint
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          cd "$RUNNER_TEMP/actionlint"
           bash <(curl -s https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
-          echo "$PWD" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
 
       - name: Actionlint workflows
         shell: bash
@@ -211,7 +213,7 @@ jobs:
           }
 
           # validate-databases.sql nao pode alterar estado.
-          foreach ($mut in @('CREATE DATABASE', 'DROP ' + 'DATABASE', 'CREATE LOGIN', 'ALTER LOGIN', 'GRANT ', 'REVOKE ', 'DROP USER', 'ADD MEMBER')) {
+          foreach ($mut in @('CREATE DATABASE', ('DROP ' + 'DATABASE'), 'CREATE LOGIN', 'ALTER LOGIN', 'GRANT ', 'REVOKE ', ('DROP ' + 'USER'), 'ADD MEMBER')) {
             if ($validate -match [regex]::Escape($mut)) { throw "validate-databases.sql contem operacao mutante: $mut" }
           }
           Write-Host 'Inspecao estatica dos scripts SQL aprovada.'
@@ -252,7 +254,7 @@ jobs:
           }
 
           # 2. Credenciais hardcoded e referencias proibidas: em todos os arquivos.
-          foreach ($p in @('A' + 'KIA[0-9A-Z]{16}', 'A' + 'SIA[0-9A-Z]{16}', 'aws' + '_secret_access_key\s*=\s*\S', 'aws' + '_session_token\s*=\s*\S')) {
+          foreach ($p in @(('A' + 'KIA[0-9A-Z]{16}'), ('A' + 'SIA[0-9A-Z]{16}'), ('aws' + '_secret_access_key\s*=\s*\S'), ('aws' + '_session_token\s*=\s*\S'))) {
             if ($allJoined -match $p) { throw "Credencial hardcoded: $p" }
           }
           $removalWord = 'des' + 'troy'

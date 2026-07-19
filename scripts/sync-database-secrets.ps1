@@ -411,12 +411,12 @@ foreach ($target in $targets) {
 $results | Format-Table -AutoSize
 
 if ($DryRun) {
-    Write-Host "DryRun aprovado."
-    Write-Host "$payloadCount payloads construidos."
-    Write-Host "0 chamadas AWS executadas."
-    Write-Host "0 valores sensiveis exibidos."
+    Write-Output "DryRun aprovado."
+    Write-Output "$payloadCount payloads construidos."
+    Write-Output "0 chamadas AWS executadas."
+    Write-Output "0 valores sensiveis exibidos."
 }
 else {
-    Write-Host "Sincronizacao concluida. $payloadCount payloads processados em $awsCallsExecuted chamadas AWS."
-    Write-Host "0 valores sensiveis exibidos."
+    Write-Output "Sincronizacao concluida. $payloadCount payloads processados em $awsCallsExecuted chamadas AWS."
+    Write-Output "0 valores sensiveis exibidos."
 }
