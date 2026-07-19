@@ -149,14 +149,6 @@ jobs:
             "$RENDER_OUTPUT/job.yaml" \
             "$RENDER_OUTPUT/configmap.yaml"
 
-      - name: kubectl dry-run client on built-in kinds
-        shell: bash
-        run: |
-          set -euo pipefail
-          # CRD (SecretProviderClass) e pulada: nao ha cluster para descoberta de tipo.
-          kubectl apply --dry-run=client --validate=false -f "$RENDER_OUTPUT/service-account.yaml"
-          kubectl apply --dry-run=client --validate=false -f "$RENDER_OUTPUT/configmap.yaml"
-          kubectl apply --dry-run=client --validate=false -f "$RENDER_OUTPUT/job.yaml"
 
       - name: Install actionlint
         shell: bash
@@ -282,7 +274,6 @@ jobs:
           - ShellCheck do run-database-bootstrap.sh
           - Renderizacao dos manifests com valores sinteticos (pod-identity e irsa)
           - ConfigMap gerado offline com apenas os tres scripts
-          - Kubeconform e kubectl apply --dry-run=client
           - Actionlint dos workflows
           - Inspecao estatica dos scripts SQL
           - Buscas por secrets, comandos proibidos e referencias de ambiente

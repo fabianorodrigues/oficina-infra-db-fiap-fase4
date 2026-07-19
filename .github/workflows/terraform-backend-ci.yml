@@ -130,7 +130,11 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $files = Get-ChildItem -Recurse -File -Force |
-            Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' -and $_.FullName -notmatch '[\\/]\.vs[\\/]' }
+            Where-Object {
+              $_.FullName -notmatch '[\\/]\.git[\\/]' -and
+              $_.FullName -notmatch '[\\/]\.vs[\\/]' -and
+              $_.FullName -notmatch '[\\/]\.terraform[\\/]'
+            }
           $content = $files | ForEach-Object { Get-Content -Raw -Path $_.FullName }
           $joined = $content -join "`n"
 

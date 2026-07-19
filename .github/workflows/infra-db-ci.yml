@@ -150,7 +150,11 @@ jobs:
             Get-ChildItem -Path '.github/workflows' -Filter 'infra-db-*.yml' -File -Force
             Get-Item -Path '.github/workflows/database-secrets-sync.yml'
           ) | Where-Object {
-            $_.FullName -notmatch '\\.terraform\\'
+            # Classe de caractere [\\/]: o runner e Linux e usa '/', entao um padrao
+            # so com barra invertida nunca casa e o diretorio .terraform (criado pelo
+            # terraform init deste job) seria lido como texto, incluindo o binario do
+            # provider AWS -- que contem caminhos como o do gerador de aleatorios.
+            $_.FullName -notmatch '[\\/]\.terraform[\\/]'
           }
           $contentByPath = @{}
           foreach ($file in $files) {
