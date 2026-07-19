@@ -1,209 +1,262 @@
-# oficina-infra-db-fiap-fase4
+# oficina-infra-db
+
+> Fundação da solução Oficina: rede, banco de dados relacional e segredos de acesso.
+> **Terraform** · **AWS** (VPC, RDS SQL Server, Secrets Manager, SSM) · **GitHub Actions**
+
+---
+
+## A solução
+
+A **Oficina** é uma plataforma de gestão de oficina mecânica distribuída em **6 repositórios** que compõem um único sistema na AWS. O cliente acessa uma API Gateway que autentica na borda e encaminha o tráfego para três microsserviços .NET 10 em EKS, que se comunicam por HTTP e por filas SQS FIFO e persistem em um RDS SQL Server compartilhado.
+
+```mermaid
+flowchart LR
+    Cliente([Cliente HTTP]) --> APIGW["API Gateway<br/>HTTP API"]
+    APIGW --> Auth["Lambdas de autenticação<br/>login + authorizer"]
+    APIGW --> ALB["ALB interno<br/>via VPC Link"]
+
+    ALB --> Cadastro["oficina-cadastro"]
+    ALB --> Estoque["oficina-estoque"]
+    ALB --> Ordens["oficina-ordens-servico"]
+
+    Ordens <-->|"SQS FIFO"| Estoque
+    Ordens -->|"HTTP interno"| Cadastro
+
+    Cadastro --> RDS[("RDS SQL Server")]
+    Estoque --> RDS
+    Ordens --> RDS
+    Auth --> RDS
+```
+
+| Repositório | Responsabilidade |
+|---|---|
+| **oficina-infra-db** *(este)* | Rede, banco de dados, segredos e estado do Terraform |
+| [oficina-infra](https://github.com/fabianorodrigues/oficina-infra-fiap-fase4) | Plataforma EKS e entrypoint de API |
+| [oficina-auth-lambda](https://github.com/fabianorodrigues/oficina-auth-lambda-fiap-fase4) | Autenticação por CPF e emissão de token |
+| [oficina-cadastro](https://github.com/fabianorodrigues/oficina-cadastro-fiap-fase4) | Clientes, veículos, funcionários e catálogo de serviços |
+| [oficina-estoque](https://github.com/fabianorodrigues/oficina-estoque-fiap-fase4) | Peças, insumos, saldos e reservas |
+| [oficina-ordens-servico](https://github.com/fabianorodrigues/oficina-ordens-servico-fiap-fase4) | Ordens de serviço, orçamento e saga de pagamento |
+
+---
+
+## Ordem de deploy
+
+Os repositórios têm dependências reais entre si. Esta é a sequência obrigatória — cada workflow valida suas precondições e falha se a etapa anterior não tiver sido concluída.
+
+| # | Repositório | Workflow | Confirmação |
+|---|---|---|---|
+| **1** | **oficina-infra-db** | **Database Infrastructure Deploy** | `APPLY` |
+| 2 | oficina-infra | Platform Deploy | `APPLY` |
+| **3** | **oficina-infra-db** | **Database Bootstrap** | `BOOTSTRAP` |
+| 4 | oficina-auth-lambda | Auth Deploy | `DEPLOY` |
+| 5 | cadastro · estoque · ordens-servico | Deploy | `DEPLOY` |
+| 6 | oficina-infra | Entrypoint Deploy | `APPLY` |
+| 7 | oficina-infra | Observability Validate | `VALIDATE` |
+| 8 | oficina-ordens-servico | AWS E2E Validate | `VALIDATE` |
+
+> **Este repositório abre e retoma a sequência.** A etapa 1 cria o bucket S3 que armazena o estado do Terraform de **todos** os stacks da solução — sem ela, os deploys de plataforma, entrypoint e autenticação abortam na verificação do bucket. A etapa 3 depende do cluster EKS criado na etapa 2, por isso não é adjacente à etapa 1.
+
+---
 
 ## Responsabilidade
 
-Provisiona a rede e a camada de dados da solução Oficina: VPC independente,
-subnets, RDS SQL Server, backend remoto do Terraform e o bootstrap idempotente
-dos três bancos lógicos (`OficinaCadastroDb`, `OficinaEstoqueDb`,
-`OficinaOrdensServicoDb`) com seus logins e usuários. É o primeiro repositório
-provisionado na sequência descrita no README de
-[oficina-infra-fiap-fase4](../oficina-infra-fiap-fase4/README.md#ordem-de-provisionamento).
+Este repositório provisiona a camada de dados e a fundação de estado:
 
-- Backend Terraform: [terraform/backend/README.md](terraform/backend/README.md)
-- Infra DB: [terraform/infra-db/README.md](terraform/infra-db/README.md)
-- Bootstrap dos bancos: [deploy/bootstrap/README.md](deploy/bootstrap/README.md)
+- **Rede** — VPC dedicada, 2 subnets públicas e 2 privadas em zonas distintas, Internet Gateway e um NAT Gateway. As subnets recebem as tags que o EKS e o balanceador exigem para descoberta automática.
+- **Banco de dados** — instância RDS SQL Server Express, criptografada, sem acesso público, com a senha do usuário master gerenciada pelo próprio RDS.
+- **Segredos** — 7 contêineres no Secrets Manager (um par de credenciais por serviço, mais um leitor para a autenticação), preenchidos a partir das senhas configuradas no GitHub.
+- **Estado do Terraform** — bucket S3 versionado, criptografado, com bloqueio de acesso público e política que exige TLS.
+- **Bootstrap dos bancos** — Job no EKS que cria os bancos lógicos, os logins e as permissões.
 
-## Sincronizacao centralizada dos secrets SQL
+---
 
-Este repositorio e o unico proprietario das senhas SQL da stack. As sete senhas
-sao recebidas como Repository Secrets, montadas em um payload JSON por destino e
-gravadas nos containers provisionados no AWS Secrets Manager pelo workflow
-`Database Infrastructure Deploy`.
+## Arquitetura
 
-Nenhuma senha e versionada. O contrato versionado
-[config/database-secrets.json](config/database-secrets.json) contem apenas
-informacoes nao sensiveis: nomes de secrets, nomes de variaveis de ambiente,
-bancos, usuarios e os parametros SSM de endpoint e porta.
+```mermaid
+flowchart TB
+    subgraph VPC["VPC dedicada"]
+        direction TB
+        Pub["2 subnets públicas<br/>Internet Gateway + NAT"]
+        Priv["2 subnets privadas"]
+        RDS[("RDS SQL Server Express<br/>criptografado, sem acesso público")]
+        Pub --> Priv --> RDS
+    end
 
-### Ownership
+    subgraph Contratos["Publicado para os demais repositórios"]
+        direction LR
+        SSM["SSM Parameter Store<br/>10 parâmetros"]
+        SM["Secrets Manager<br/>7 segredos de banco"]
+        S3[("Bucket S3<br/>estado do Terraform")]
+    end
 
-Todas as senhas SQL pertencem ao repositorio `oficina-infra-db-fiap-fase4`.
-
-Os repositorios consumidores nao recebem as senhas, nao recebem connection
-strings por GitHub Secret e nao duplicam nenhum valor. Eles apenas referenciam
-os nomes dos secrets no Secrets Manager e, posteriormente, consomem os valores
-via CSI/ASCP ou acesso runtime autorizado.
-
-### Repository Secrets (somente neste repositorio)
-
-Senhas SQL sincronizadas por este workflow:
-
-```text
-SQL_CADASTRO_APP_PASSWORD
-SQL_CADASTRO_MIGRATOR_PASSWORD
-SQL_ESTOQUE_APP_PASSWORD
-SQL_ESTOQUE_MIGRATOR_PASSWORD
-SQL_ORDENS_APP_PASSWORD
-SQL_ORDENS_MIGRATOR_PASSWORD
-SQL_AUTH_READ_PASSWORD
+    VPC --> SSM
+    VPC --> SM
+    Bootstrap["Job Database Bootstrap<br/>executa no EKS"] --> RDS
 ```
 
-Credenciais temporarias da AWS (necessarias antes de acessar a AWS):
+O acoplamento entre repositórios é feito **por nome de parâmetro no SSM e no Secrets Manager**. Não há leitura de estado entre stacks: cada stack lê apenas o que o anterior publicou.
 
-```text
-AWS_ACCESS_KEY_ID
-AWS_SECRET_ACCESS_KEY
-AWS_SESSION_TOKEN
+---
+
+## Contrato de integração
+
+### Publica
+
+| Recurso | Caminho | Consumido por |
+|---|---|---|
+| VPC | `/oficina/infra/vpc/id` | infra (plataforma e entrypoint), auth |
+| Subnets privadas | `/oficina/infra/subnets/private/{1,2}` | infra, auth |
+| Subnets públicas | `/oficina/infra/subnets/public/{1,2}` | infra |
+| RDS | `/oficina/infra/rds/{identifier,endpoint,port}` | bootstrap deste repositório |
+| Grupo de segurança do RDS | `/oficina/infra/rds/security-group-id` | infra, auth |
+| Segredo master do RDS | `/oficina/infra/rds/master-secret-arn` | infra, bootstrap |
+| Credenciais dos serviços | `/oficina/{cadastro,estoque,ordens}/{runtime,migration}-db` | cadastro, estoque, ordens |
+| Credencial de leitura da autenticação | `/oficina/auth/database` | auth |
+| Estado do Terraform | Bucket S3 derivado da conta e da região | infra, auth |
+
+### Consome
+
+Nada. Este repositório é a raiz do grafo de dependências.
+
+### Matriz de bancos e logins
+
+| Banco | Login de runtime | Login de migração | Somente leitura |
+|---|---|---|---|
+| `OficinaCadastroDb` | `cadastro_app` | `cadastro_migrator` | `auth_read` |
+| `OficinaEstoqueDb` | `estoque_app` | `estoque_migrator` | — |
+| `OficinaOrdensServicoDb` | `ordens_app` | `ordens_migrator` | — |
+
+O login `auth_read` existe para que a autenticação consulte os funcionários sem receber permissão de escrita.
+
+---
+
+## Configuração
+
+Configure em **Settings → Secrets and variables → Actions** do repositório.
+
+### Secrets (obrigatórios)
+
+| Secret | Uso |
+|---|---|
+| `AWS_ACCESS_KEY_ID` · `AWS_SECRET_ACCESS_KEY` · `AWS_SESSION_TOKEN` | Credenciais temporárias da AWS |
+| `SQL_CADASTRO_APP_PASSWORD` · `SQL_CADASTRO_MIGRATOR_PASSWORD` | Senhas dos logins do banco de cadastro |
+| `SQL_ESTOQUE_APP_PASSWORD` · `SQL_ESTOQUE_MIGRATOR_PASSWORD` | Senhas dos logins do banco de estoque |
+| `SQL_ORDENS_APP_PASSWORD` · `SQL_ORDENS_MIGRATOR_PASSWORD` | Senhas dos logins do banco de ordens |
+| `SQL_AUTH_READ_PASSWORD` | Senha do login de leitura da autenticação |
+
+O deploy verifica a presença das 7 senhas antes de iniciar e falha listando as que faltarem. Use senhas que atendam à política do SQL Server (maiúscula, minúscula, dígito e no mínimo 8 caracteres).
+
+### Variables
+
+| Variable | Obrigatória | Uso |
+|---|---|---|
+| `AWS_REGION` | **Sim** | Região de todos os recursos |
+| `SQL_TOOLS_IMAGE` | **Sim, para o Database Bootstrap** | Imagem com as ferramentas de linha de comando do SQL Server. Exige tag explícita — a tag móvel `latest` é rejeitada |
+| `TF_STATE_BUCKET` | Não | Apenas compatibilidade com um bucket de estado pré-existente |
+
+### O que é provisionado automaticamente
+
+Não é necessário criar nada na AWS manualmente. O bucket de estado é criado e reconciliado pelo próprio workflow, e **todos os parâmetros de infraestrutura têm valor padrão no Terraform**.
+
+> **Atenção:** CIDR da VPC, engine, classe de instância, tipo e tamanho de armazenamento do RDS são **fixos no código Terraform**. Não existem variables do GitHub para alterá-los — mudar esses valores exige editar `terraform/infra-db/variables.tf` e abrir um pull request. A única variável Terraform sem valor padrão é a região, preenchida a partir de `AWS_REGION`.
+
+---
+
+## Executar pelo GitHub Actions
+
+Ambos os workflows rodam apenas na branch `main`, exigem uma string de confirmação **sensível a maiúsculas** e não podem ser executados em paralelo consigo mesmos.
+
+### 1. Database Infrastructure Deploy — etapa 1
+
+**Actions → Database Infrastructure Deploy → Run workflow → `confirmation` = `APPLY`**
+
+Executa, em ordem: cria e reconcilia o bucket de estado → valida o plano do Terraform → aplica a rede, o RDS e os contêineres de segredo → grava as 7 senhas no Secrets Manager → revalida. Um passo de segurança **interrompe o deploy se o plano previr exclusão** de VPC, subnet, instância de banco, segredo ou parâmetro.
+
+Duração típica: 15 a 25 minutos, dominada pela criação do RDS.
+
+### 2. Database Bootstrap — etapa 3
+
+Execute **apenas depois** do Platform Deploy, pois roda como Job dentro do cluster EKS.
+
+**Actions → Database Bootstrap → Run workflow → `confirmation` = `BOOTSTRAP`**
+
+Cria os bancos lógicos, os logins e as permissões da matriz acima. É idempotente: reexecutar não duplica objetos. Os logs passam por um filtro que aborta o passo caso detecte vazamento de credencial.
+
+---
+
+## Validar
+
+### Pelo Console AWS
+
+| Serviço | O que verificar |
+|---|---|
+| **VPC** | 1 VPC, 4 subnets, 1 Internet Gateway, 1 NAT Gateway |
+| **RDS** | Instância `Available`, **Publicly accessible = No**, criptografia habilitada |
+| **Secrets Manager** | 7 segredos, cada um com uma versão `AWSCURRENT` |
+| **Parameter Store** | 10 parâmetros sob `/oficina/infra/` |
+| **S3** | Bucket de estado com versionamento e criptografia ativos |
+
+### Pela AWS CLI
+
+<details>
+<summary>Comandos de validação</summary>
+
+```bash
+REGIAO=<sua-regiao>
+
+# Parâmetros publicados para os demais repositórios
+aws ssm get-parameters-by-path --path /oficina/infra --recursive \
+  --region "$REGIAO" --query 'Parameters[].Name' --output table
+
+# RDS disponível e fechado para a internet
+aws rds describe-db-instances --region "$REGIAO" \
+  --query 'DBInstances[].{Status:DBInstanceStatus,Publico:PubliclyAccessible,Cripto:StorageEncrypted}' \
+  --output table
+
+# Cada segredo deve ter exatamente uma versão corrente
+for s in cadastro/runtime-db cadastro/migration-db estoque/runtime-db \
+         estoque/migration-db ordens/runtime-db ordens/migration-db auth/database; do
+  echo -n "/oficina/$s -> "
+  aws secretsmanager describe-secret --secret-id "/oficina/$s" \
+    --region "$REGIAO" --query 'length(VersionIdsToStages)' --output text
+done
 ```
 
-Repository Variable:
+</details>
 
-```text
-AWS_REGION
+### Validar o bootstrap
+
+O próprio workflow confirma a criação ao final. Para conferir manualmente, consulte no resumo da execução a lista de bancos, logins e permissões aplicados — o Job não expõe credenciais nos logs, por decisão de projeto.
+
+---
+
+## Executar localmente
+
+Este repositório não provisiona recursos localmente: toda alteração deve ser aplicada pelos workflows, para que o estado do Terraform permaneça consistente. O que é possível localmente é a validação estática, idêntica à executada na CI:
+
+```bash
+cd terraform/infra-db
+terraform fmt -check -recursive
+terraform init -backend=false
+terraform validate
 ```
 
-### Destinos no Secrets Manager
+---
 
-| ID                 | Repository Secret                | Secret Manager                  | Banco                  | Usuario           |
-| ------------------ | -------------------------------- | ------------------------------- | ---------------------- | ----------------- |
-| cadastro-runtime   | SQL_CADASTRO_APP_PASSWORD        | /oficina/cadastro/runtime-db    | OficinaCadastroDb      | cadastro_app      |
-| cadastro-migration | SQL_CADASTRO_MIGRATOR_PASSWORD   | /oficina/cadastro/migration-db  | OficinaCadastroDb      | cadastro_migrator |
-| estoque-runtime    | SQL_ESTOQUE_APP_PASSWORD         | /oficina/estoque/runtime-db     | OficinaEstoqueDb       | estoque_app       |
-| estoque-migration  | SQL_ESTOQUE_MIGRATOR_PASSWORD    | /oficina/estoque/migration-db   | OficinaEstoqueDb       | estoque_migrator  |
-| ordens-runtime     | SQL_ORDENS_APP_PASSWORD          | /oficina/ordens/runtime-db      | OficinaOrdensServicoDb | ordens_app        |
-| ordens-migration   | SQL_ORDENS_MIGRATOR_PASSWORD     | /oficina/ordens/migration-db    | OficinaOrdensServicoDb | ordens_migrator   |
-| auth-read          | SQL_AUTH_READ_PASSWORD           | /oficina/auth/database          | OficinaCadastroDb      | auth_read         |
+## Limitações conhecidas
 
-Cada container guarda um JSON com campos separados (`Server`, `Port`, `Database`,
-`UserId`, `Password`, `Encrypt`, `TrustServerCertificate`,
-`ConnectionTimeoutSeconds`) e um campo `ConnectionString` ja montado. `Server` e
-`Port` vem do SSM Parameter Store; `Database` e `UserId` vem do contrato
-versionado; `Password` vem do Repository Secret; a connection string e construida
-por um builder seguro do .NET.
+- **Instância única, sem alta disponibilidade.** O RDS roda em uma zona, com retenção de backup de 1 dia e sem proteção contra exclusão — dimensionado para custo de ambiente acadêmico, não para produção.
+- **Um único NAT Gateway** atende as duas subnets privadas: é ponto único de falha para o tráfego de saída.
+- **Sem monitoramento do banco.** Não há Performance Insights, monitoramento avançado, exportação de logs para o CloudWatch nem alarmes.
+- **Deploys sem aprovação manual.** O controle de acesso é a branch `main` mais a string de confirmação; não há GitHub Environments nem revisores obrigatórios.
+- **Credenciais estáticas.** Os workflows usam chave de acesso com token de sessão em vez de federação OIDC.
 
-### Scripts
+---
 
-- [scripts/validate-database-secrets-config.ps1](scripts/validate-database-secrets-config.ps1):
-  validacao local e offline do contrato (estrutura, unicidade, sete destinos e
-  ausencia de dados sensiveis). Nao acessa a AWS.
-- [scripts/validate-database-secret-containers.ps1](scripts/validate-database-secret-containers.ps1):
-  validacao read-only dos containers (existencia, nome, ARN e, apos a
-  sincronizacao, versao `AWSCURRENT`). Nunca le o conteudo dos secrets.
-- [scripts/sync-database-secrets.ps1](scripts/sync-database-secrets.ps1):
-  le cada senha de environment variable, monta o payload e executa
-  `put-secret-value` em containers existentes. Possui `-DryRun` que constroi os
-  sete payloads em memoria sem acessar a AWS. Nunca imprime senhas, connection
-  strings ou o payload.
+## Próxima etapa
 
-### Workflow Database Infrastructure Deploy
+Com a rede, o banco e o bucket de estado disponíveis, prossiga para a etapa 2:
 
-Disparo manual, somente na branch `main`, com confirmacao explicita:
+**→ [oficina-infra](https://github.com/fabianorodrigues/oficina-infra-fiap-fase4)** — provisiona o cluster EKS, os repositórios de imagem e as filas.
 
-```text
-GitHub
--> Actions
--> Database Infrastructure Deploy
--> Run workflow
--> Branch main
--> confirmation APPLY
-```
-
-Sequencia: valida branch, confirmacao, `AWS_REGION` e a presenca dos sete
-Repository Secrets; configura credenciais; resolve ou reconcilia o backend
-Terraform; executa `terraform plan` salvo e `terraform apply` desse plan; valida
-VPC, RDS, SSM e containers; sincroniza os sete secrets SQL; valida
-`AWSCURRENT`; publica um Step Summary sanitizado.
-
-A reexecucao e idempotente: o `ClientRequestToken` e um SHA-256 do payload
-completo, portanto a mesma senha e a mesma configuracao nao criam uma nova
-versao; uma senha alterada gera uma nova versao. O workflow nunca cria, atualiza
-ou remove containers, apenas executa `put-secret-value`.
-
-### Integracao com a CI
-
-A pipeline [.github/workflows/database-infrastructure-ci.yml](.github/workflows/database-infrastructure-ci.yml)
-valida estes arquivos em cada Pull Request, sem credenciais AWS e sem senhas
-reais: Terraform, contratos, PowerShell AST, ShellCheck, dry runs, manifests do
-bootstrap, kubeconform, Actionlint e buscas estaticas por credenciais, imagens
-sem tag imutavel e operacoes destrutivas.
-
-### Dependencias
-
-```text
-Infra DB provisionada
-Containers de Secrets Manager existentes
-Parametros SSM de endpoint (/oficina/infra/rds/endpoint) e porta (/oficina/infra/rds/port)
-Credenciais AWS validas
-```
-
-### Consumidores
-
-```text
-Cadastro runtime le  /oficina/cadastro/runtime-db
-Cadastro migration le /oficina/cadastro/migration-db
-Estoque runtime le  /oficina/estoque/runtime-db
-Estoque migration le /oficina/estoque/migration-db
-Ordens runtime le   /oficina/ordens/runtime-db
-Ordens migration le  /oficina/ordens/migration-db
-Auth CPF le         /oficina/auth/database
-```
-
-### Seguranca
-
-- Nenhuma senha em Terraform, em `tfvars`, no state, em manifests ou em outputs.
-- Nenhuma senha duplicada nos repositorios consumidores.
-- Nenhum valor de secret e lido pelos scripts de validacao.
-- Senhas recebidas somente por environment variable, nunca por argumento.
-- Payload temporario criado no diretorio temporario do sistema, com permissao
-  restritiva quando suportada, e removido no bloco `finally`.
-- Reexecucao idempotente via `ClientRequestToken`.
-
-## Bootstrap estrutural dos bancos
-
-Depois de `Database Infrastructure Deploy` e `Platform Deploy`, o bootstrap idempotente cria
-os tres bancos, os sete logins/usuarios e as permissoes minimas por meio de um
-Kubernetes Job (`db-bootstrap`) que consome o master secret e os sete secrets
-SQL via Secrets Store CSI Driver + ASCP. Detalhes e execucao futura:
-[deploy/bootstrap/README.md](deploy/bootstrap/README.md).
-
-### Componentes
-
-```text
-config/database-bootstrap.json          Contrato nao sensivel do bootstrap
-scripts/bootstrap-databases.sql          T-SQL idempotente (bancos/logins/usuarios/permissoes)
-scripts/validate-databases.sql           Validacao T-SQL read-only
-scripts/run-database-bootstrap.sh        Runner do Job (escape T-SQL, render, sqlcmd)
-scripts/render-database-bootstrap-manifests.ps1  Renderer dos manifests
-scripts/validate-database-bootstrap-config.ps1   Validacao offline do contrato
-scripts/validate-database-bootstrap.ps1  Validacao read-only pos-execucao
-deploy/bootstrap/                        ServiceAccount, SecretProviderClass, Job, kustomization
-.github/workflows/database-bootstrap-deploy.yml  Deploy manual (main + BOOTSTRAP)
-```
-
-### Matriz de bancos, logins e permissoes
-
-| Banco | Runtime (datareader+datawriter+EXECUTE) | Migrator (+db_ddladmin) | Read-only |
-| ----- | --------------------------------------- | ----------------------- | --------- |
-| OficinaCadastroDb | cadastro_app | cadastro_migrator | auth_read (role `auth_reader`) |
-| OficinaEstoqueDb | estoque_app | estoque_migrator | - |
-| OficinaOrdensServicoDb | ordens_app | ordens_migrator | - |
-
-Runtime nunca recebe DDL; migrator nunca recebe `db_owner`; `auth_read` existe
-somente no Cadastro. A ampliacao de permissao do migrator (alem de `db_ddladmin`)
-so deve ocorrer apos erro real de migration do EF, nunca preventivamente.
-
-### Configuracao do workflow de deploy
-
-```text
-Repository Secrets:  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
-Repository Variables: AWS_REGION, SQL_TOOLS_IMAGE
-```
-
-Nenhuma password SQL vira Repository Secret nesta etapa: elas ja pertencem ao
-fluxo centralizado da Etapa 7 e vivem no Secrets Manager.
-
-## Próximo componente
-
-Depois de `Database Infrastructure Deploy`, siga para
-[oficina-infra-fiap-fase4](../oficina-infra-fiap-fase4/README.md) para
-provisionar a plataforma (EKS, ECR, SQS) e o ponto de entrada público.
+Concluída a etapa 2, retorne aqui para executar o **Database Bootstrap** (etapa 3).
