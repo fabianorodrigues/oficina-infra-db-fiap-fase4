@@ -1,0 +1,230 @@
+name: Database Infrastructure CI
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - config/**
+      - deploy/bootstrap/**
+      - scripts/**
+      - terraform/**
+      - .github/workflows/database-infrastructure-*.yml
+      - .github/workflows/database-bootstrap-deploy.yml
+      - .tflint.hcl
+      - .gitignore
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Static validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Terraform fmt
+        working-directory: terraform/infra-db
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        working-directory: terraform/infra-db
+        run: terraform init -backend=false
+
+      - name: Terraform validate
+        working-directory: terraform/infra-db
+        run: terraform validate
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+
+      - name: TFLint
+        working-directory: terraform/infra-db
+        run: tflint --init && tflint
+
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform/infra-db
+          framework: terraform
+          check: CKV_AWS_16,CKV_AWS_17,CKV_AWS_23,CKV_AWS_24
+          quiet: true
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Validate PowerShell syntax
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem -Path scripts -Filter *.ps1 -File | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "$($_.Extent.File): $($_.Message)" }
+              exit 1
+            }
+          }
+
+      - name: ShellCheck
+        shell: bash
+        run: shellcheck --shell=bash scripts/run-database-bootstrap.sh
+
+      - name: Validate contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/validate-database-secrets-config.ps1 -ConfigPath config/database-secrets.json
+          ./scripts/validate-database-bootstrap-config.ps1 -ConfigPath config/database-bootstrap.json -SecretsConfigPath config/database-secrets.json
+
+      - name: Backend dry run
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/create-terraform-backend.ps1 `
+            -BucketName 'oficina-terraform-state-123456789012-us-east-1' `
+            -Region 'us-east-1' `
+            -DryRun
+
+      - name: Secrets sync dry run
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $names = @(
+            'SQL_CADASTRO_APP_PASSWORD',
+            'SQL_CADASTRO_MIGRATOR_PASSWORD',
+            'SQL_ESTOQUE_APP_PASSWORD',
+            'SQL_ESTOQUE_MIGRATOR_PASSWORD',
+            'SQL_ORDENS_APP_PASSWORD',
+            'SQL_ORDENS_MIGRATOR_PASSWORD',
+            'SQL_AUTH_READ_PASSWORD'
+          )
+          $suffix = 'CI-Synthetic-Value-Not-Real-0001!'
+          foreach ($name in $names) {
+            [Environment]::SetEnvironmentVariable($name, "$name-$suffix")
+          }
+          try {
+            $output = ./scripts/sync-database-secrets.ps1 `
+              -ConfigPath config/database-secrets.json `
+              -DryRun `
+              -ServerOverride 'synthetic-rds.internal.invalid' `
+              -PortOverride 1433 | Out-String
+          }
+          finally {
+            foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $null) }
+          }
+          Write-Host $output
+          if ($output -notmatch '7 payloads construidos\.') { throw 'Dry run did not build seven payloads.' }
+          if ($output -notmatch '0 chamadas AWS executadas\.') { throw 'Dry run called AWS.' }
+          if ($output -match [regex]::Escape($suffix)) { throw 'Dry run leaked a synthetic value.' }
+
+      - name: Render bootstrap manifests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'database-bootstrap'
+          ./scripts/render-database-bootstrap-manifests.ps1 `
+            -ConfigPath config/database-bootstrap.json `
+            -TemplateDirectory deploy/bootstrap `
+            -OutputDirectory $out `
+            -JobName 'oficina-db-bootstrap-ci-0001' `
+            -MasterSecretArn 'arn:aws:secretsmanager:us-east-1:000000000000:secret:synthetic-master-AbCdEf' `
+            -Region 'us-east-1' `
+            -SqlToolsImage 'mcr.microsoft.com/mssql-tools18:synthetic-ci-0001' `
+            -WorkloadIdentityMode 'pod-identity' `
+            -RdsHost 'synthetic-rds.internal.invalid' `
+            -RdsPort '1433'
+          "RENDER_OUTPUT=$out" | Add-Content -Path $env:GITHUB_ENV
+
+      - name: Generate scripts ConfigMap
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/bootstrap > "$RENDER_OUTPUT/configmap.yaml"
+          if grep -Eiq 'secret_?string|-----BEGIN|AKIA[0-9A-Z]{16}' "$RENDER_OUTPUT/configmap.yaml"; then
+            echo "ConfigMap contains sensitive content." >&2
+            exit 1
+          fi
+
+      - name: Kubeconform
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="v0.6.7"
+          curl -sSL "https://github.com/yannh/kubeconform/releases/download/${version}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin kubeconform
+          kubeconform -strict -ignore-missing-schemas -summary \
+            "$RENDER_OUTPUT/service-account.yaml" \
+            "$RENDER_OUTPUT/secret-provider-class.yaml" \
+            "$RENDER_OUTPUT/job.yaml" \
+            "$RENDER_OUTPUT/configmap.yaml"
+
+      - name: Actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          cd "$RUNNER_TEMP/actionlint"
+          bash <(curl -s https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          "$RUNNER_TEMP/actionlint/actionlint" \
+            "$GITHUB_WORKSPACE/.github/workflows/database-infrastructure-ci.yml" \
+            "$GITHUB_WORKSPACE/.github/workflows/database-infrastructure-deploy.yml" \
+            "$GITHUB_WORKSPACE/.github/workflows/database-bootstrap-deploy.yml"
+
+      - name: Static safety checks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = Get-ChildItem -Path config,deploy,scripts,terraform,.github/workflows -Recurse -File -Force |
+            Where-Object {
+              $_.FullName -notmatch '[\\/]\.terraform[\\/]' -and
+              $_.FullName -notmatch '[\\/]\.github[\\/]workflows[\\/]database-infrastructure-ci\.yml$'
+            }
+          $joined = ($files | ForEach-Object { Get-Content -Raw -Path $_.FullName }) -join "`n"
+          foreach ($pattern in @(
+            'AKIA[0-9A-Z]{16}',
+            'ASIA[0-9A-Z]{16}',
+            'aws_access_key_id\s*=',
+            'aws_secret_access_key\s*=',
+            'aws_session_token\s*=',
+            'continue-on-error:\s*true',
+            'pull_request_target',
+            'terraform\s+destroy',
+            'kubectl\s+rollout\s+undo'
+          )) {
+            if ($joined -match $pattern) { throw "Forbidden pattern found: $pattern" }
+          }
+          $latestMatches = $files | Select-String -Pattern 'image:\s*["'']?[^"''\s]+:latest\b'
+          if ($latestMatches) {
+            $match = $latestMatches | Select-Object -First 1
+            throw "Forbidden latest image tag found in $($match.Path):$($match.LineNumber)"
+          }
+          $terraformJoined = (Get-ChildItem -Path terraform/infra-db -Filter *.tf -File | ForEach-Object { Get-Content -Raw -Path $_.FullName }) -join "`n"
+          foreach ($pattern in @('publicly_accessible\s*=\s*true', 'secret_string\s*=', 'aws_secretsmanager_secret_version', 'terraform_remote_state')) {
+            if ($terraformJoined -match $pattern) { throw "Forbidden Terraform pattern found: $pattern" }
+          }
+
+      - name: Publish summary
+        shell: pwsh
+        run: |
+          @"
+          ## Database Infrastructure CI
+
+          Static validation finished:
+          - Terraform fmt, init, validate, TFLint and Checkov
+          - PowerShell AST and ShellCheck
+          - Database contracts
+          - Backend and SQL secrets dry runs
+          - Bootstrap manifest rendering and kubeconform
+          - Actionlint and static safety checks
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY

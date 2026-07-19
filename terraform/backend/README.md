@@ -38,25 +38,18 @@ Crie:
 
 ```text
 AWS_REGION
-TF_STATE_BUCKET
-TF_STATE_REGION
 ```
 
-`AWS_REGION` deve ser a regiao da conta AWS utilizada. `TF_STATE_REGION` deve ter o mesmo valor. `TF_STATE_BUCKET` deve ser globalmente unico.
-
-Formato sugerido para o bucket:
+`AWS_REGION` deve ser a regiao da conta AWS utilizada. O workflow
+`Database Infrastructure Deploy` resolve o bucket pelo formato deterministico:
 
 ```text
-oficina-terraform-state-<ACCOUNT_ID>-<REGIAO>
+oficina-terraform-state-<account-id>-<AWS_REGION>
 ```
 
-Para obter o Account ID, configure as credenciais temporarias localmente e execute:
-
-```powershell
-aws sts get-caller-identity
-```
-
-Nao crie o bucket pelo Console. A criacao e a reconciliacao devem ocorrer somente pelo workflow manual.
+Durante migracao, `TF_STATE_BUCKET` pode existir como fallback temporario se um
+bucket legado ja tiver state. Nao crie o bucket pelo Console. A criacao e a
+reconciliacao devem ocorrer somente pelo workflow manual consolidado.
 
 ## Execucao
 
@@ -65,14 +58,14 @@ Depois do Pull Request aprovado e mergeado na `main`:
 ```text
 GitHub
 Actions
-Terraform Backend Deploy
+Database Infrastructure Deploy
 Run workflow
 Branch main
-confirmation CREATE
+confirmation APPLY
 Run workflow
 ```
 
-O workflow falha se a branch nao for `main`, se a confirmacao nao for exatamente `CREATE`, se alguma variable obrigatoria estiver vazia ou se `AWS_REGION` e `TF_STATE_REGION` forem diferentes.
+O workflow falha se a branch nao for `main`, se a confirmacao nao for exatamente `APPLY`, se `AWS_REGION` estiver vazia ou se a validacao do backend falhar.
 
 ## Validacao
 

@@ -17,8 +17,8 @@ provisionado na sequência descrita no README de
 
 Este repositorio e o unico proprietario das senhas SQL da stack. As sete senhas
 sao recebidas como Repository Secrets, montadas em um payload JSON por destino e
-gravadas nos containers ja provisionados no AWS Secrets Manager pelo workflow
-`Database Secrets Sync`.
+gravadas nos containers provisionados no AWS Secrets Manager pelo workflow
+`Database Infrastructure Deploy`.
 
 Nenhuma senha e versionada. O contrato versionado
 [config/database-secrets.json](config/database-secrets.json) contem apenas
@@ -95,23 +95,24 @@ por um builder seguro do .NET.
   sete payloads em memoria sem acessar a AWS. Nunca imprime senhas, connection
   strings ou o payload.
 
-### Workflow Database Secrets Sync
+### Workflow Database Infrastructure Deploy
 
 Disparo manual, somente na branch `main`, com confirmacao explicita:
 
 ```text
 GitHub
 -> Actions
--> Database Secrets Sync
+-> Database Infrastructure Deploy
 -> Run workflow
 -> Branch main
--> confirmation SYNC
+-> confirmation APPLY
 ```
 
 Sequencia: valida branch, confirmacao, `AWS_REGION` e a presenca dos sete
-Repository Secrets; configura credenciais; valida identidade; valida o contrato;
-valida os containers antes da sincronizacao; executa a sincronizacao; valida os
-containers com `AWSCURRENT` obrigatorio; publica um Step Summary sanitizado.
+Repository Secrets; configura credenciais; resolve ou reconcilia o backend
+Terraform; executa `terraform plan` salvo e `terraform apply` desse plan; valida
+VPC, RDS, SSM e containers; sincroniza os sete secrets SQL; valida
+`AWSCURRENT`; publica um Step Summary sanitizado.
 
 A reexecucao e idempotente: o `ClientRequestToken` e um SHA-256 do payload
 completo, portanto a mesma senha e a mesma configuracao nao criam uma nova
@@ -120,11 +121,11 @@ ou remove containers, apenas executa `put-secret-value`.
 
 ### Integracao com a CI
 
-A pipeline [.github/workflows/infra-db-ci.yml](.github/workflows/infra-db-ci.yml)
+A pipeline [.github/workflows/database-infrastructure-ci.yml](.github/workflows/database-infrastructure-ci.yml)
 valida estes arquivos em cada Pull Request, sem credenciais AWS e sem senhas
-reais: JSON e contrato validos, PowerShell AST dos quatro scripts, DryRun com
-valores sinteticos, Actionlint do workflow e buscas estaticas por credenciais,
-connection strings e artefatos temporarios.
+reais: Terraform, contratos, PowerShell AST, ShellCheck, dry runs, manifests do
+bootstrap, kubeconform, Actionlint e buscas estaticas por credenciais, imagens
+sem tag imutavel e operacoes destrutivas.
 
 ### Dependencias
 
@@ -159,7 +160,7 @@ Auth CPF le         /oficina/auth/database
 
 ## Bootstrap estrutural dos bancos
 
-Depois de Infra DB, Platform, EKS e Secrets Sync, o bootstrap idempotente cria
+Depois de `Database Infrastructure Deploy` e `Platform Deploy`, o bootstrap idempotente cria
 os tres bancos, os sete logins/usuarios e as permissoes minimas por meio de um
 Kubernetes Job (`db-bootstrap`) que consome o master secret e os sete secrets
 SQL via Secrets Store CSI Driver + ASCP. Detalhes e execucao futura:
@@ -176,7 +177,6 @@ scripts/render-database-bootstrap-manifests.ps1  Renderer dos manifests
 scripts/validate-database-bootstrap-config.ps1   Validacao offline do contrato
 scripts/validate-database-bootstrap.ps1  Validacao read-only pos-execucao
 deploy/bootstrap/                        ServiceAccount, SecretProviderClass, Job, kustomization
-.github/workflows/database-bootstrap-ci.yml      CI estatica (sem AWS)
 .github/workflows/database-bootstrap-deploy.yml  Deploy manual (main + BOOTSTRAP)
 ```
 
@@ -204,7 +204,6 @@ fluxo centralizado da Etapa 7 e vivem no Secrets Manager.
 
 ## Próximo componente
 
-Depois de `Backend Bootstrap`, `Infra DB Deploy`, `Database Secrets Sync` e
-`Database Bootstrap`, siga para
+Depois de `Database Infrastructure Deploy`, siga para
 [oficina-infra-fiap-fase4](../oficina-infra-fiap-fase4/README.md) para
 provisionar a plataforma (EKS, ECR, SQS) e o ponto de entrada público.

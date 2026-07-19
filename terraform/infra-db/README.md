@@ -66,9 +66,6 @@ Obrigatorias:
 
 ```text
 AWS_REGION
-TF_STATE_BUCKET
-TF_STATE_REGION
-TF_STATE_KEY_INFRA_DB
 VPC_CIDR
 RDS_DATABASE_PORT
 ```
@@ -76,7 +73,6 @@ RDS_DATABASE_PORT
 Valores planejados:
 
 ```text
-TF_STATE_KEY_INFRA_DB=oficina/infra-db/terraform.tfstate
 VPC_CIDR=10.40.0.0/16
 RDS_DATABASE_PORT=1433
 ```
@@ -106,20 +102,20 @@ Depois do Pull Request aprovado e mergeado na `main`:
 ```text
 GitHub
 Actions
-Infra DB Deploy
+Database Infrastructure Deploy
 Run workflow
 Branch main
 confirmation APPLY
 Run workflow
 ```
 
-O workflow falha se a branch nao for `main`, se a confirmacao nao for exatamente `APPLY`, se variables obrigatorias estiverem vazias, se `AWS_REGION` e `TF_STATE_REGION` forem diferentes ou se a validacao read-only pos-apply falhar.
+O workflow falha se a branch nao for `main`, se a confirmacao nao for exatamente `APPLY`, se `AWS_REGION` estiver vazia, se os sete secrets SQL estiverem ausentes ou se a validacao read-only pos-apply falhar. O bucket do state e resolvido como `oficina-terraform-state-<account-id>-<AWS_REGION>`, com fallback temporario para `TF_STATE_BUCKET` durante migracao.
 
 ## Como validar
 
 Validacoes esperadas:
 
-- workflow `Infra DB Deploy` verde;
+- workflow `Database Infrastructure Deploy` verde;
 - GitHub Step Summary sanitizado;
 - RDS com status `Available`;
 - RDS com `Publicly accessible: No`;
@@ -148,7 +144,7 @@ Addons
 Depois disso, etapas especificas deverao executar:
 
 ```text
-Database Secrets Sync
+Database Infrastructure Deploy
 Database Bootstrap
 ```
 
@@ -156,7 +152,7 @@ Essas etapas criarao os bancos logicos, usuarios SQL e valores funcionais de sec
 
 ## Validação sem acesso à AWS
 
-Esta implementacao pode ser validada estaticamente sem acesso a AWS. O primeiro `terraform plan` real e o primeiro `terraform apply` real devem ocorrer somente pelo workflow manual `Infra DB Deploy`, na branch `main`.
+Esta implementacao pode ser validada estaticamente sem acesso a AWS. O primeiro `terraform plan` real e o primeiro `terraform apply` real devem ocorrer somente pelo workflow manual `Database Infrastructure Deploy`, na branch `main`.
 
 Validacoes AWS pendentes ate a primeira execucao real:
 
