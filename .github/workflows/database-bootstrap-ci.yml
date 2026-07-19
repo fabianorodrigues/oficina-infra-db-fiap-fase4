@@ -1,0 +1,282 @@
+name: Database Bootstrap CI
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - config/database-bootstrap.json
+      - config/database-secrets.json
+      - scripts/bootstrap-databases.sql
+      - scripts/validate-databases.sql
+      - scripts/run-database-bootstrap.sh
+      - scripts/render-database-bootstrap-manifests.ps1
+      - scripts/validate-database-bootstrap-config.ps1
+      - scripts/validate-database-bootstrap.ps1
+      - deploy/bootstrap/**
+      - .github/workflows/database-bootstrap-*.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Static validation (no AWS)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate JSON contracts
+        shell: pwsh
+        run: |
+          ./scripts/validate-database-secrets-config.ps1 -ConfigPath config/database-secrets.json
+          ./scripts/validate-database-bootstrap-config.ps1 -ConfigPath config/database-bootstrap.json -SecretsConfigPath config/database-secrets.json
+
+      - name: PowerShell AST validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scripts = @(
+            'scripts/render-database-bootstrap-manifests.ps1',
+            'scripts/validate-database-bootstrap-config.ps1',
+            'scripts/validate-database-bootstrap.ps1'
+          )
+          foreach ($script in $scripts) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "${script}: $($_.Message)" }
+              exit 1
+            }
+          }
+          Write-Host 'PowerShell AST valido nos tres scripts.'
+
+      - name: ShellCheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          shellcheck --shell=bash scripts/run-database-bootstrap.sh
+
+      - name: Render manifests with synthetic values
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path ([System.IO.Path]::GetTempPath()) ("bootstrap-render-" + [System.Guid]::NewGuid().ToString('N'))
+          ./scripts/render-database-bootstrap-manifests.ps1 `
+            -ConfigPath config/database-bootstrap.json `
+            -TemplateDirectory deploy/bootstrap `
+            -OutputDirectory $out `
+            -JobName 'oficina-db-bootstrap-ci-0001' `
+            -MasterSecretArn 'arn:aws:secretsmanager:us-east-1:000000000000:secret:synthetic-master-AbCdEf' `
+            -Region 'us-east-1' `
+            -SqlToolsImage 'mcr.microsoft.com/mssql-tools18:synthetic-ci-0001' `
+            -WorkloadIdentityMode 'pod-identity' `
+            -RdsHost 'synthetic-rds.internal.invalid' `
+            -RdsPort '1433'
+          "RENDER_OUTPUT=$out" | Add-Content -Path $env:GITHUB_ENV
+
+          # Renderizacao IRSA sintetica (verifica o caminho da annotation).
+          $outIrsa = Join-Path ([System.IO.Path]::GetTempPath()) ("bootstrap-render-irsa-" + [System.Guid]::NewGuid().ToString('N'))
+          ./scripts/render-database-bootstrap-manifests.ps1 `
+            -ConfigPath config/database-bootstrap.json `
+            -TemplateDirectory deploy/bootstrap `
+            -OutputDirectory $outIrsa `
+            -JobName 'oficina-db-bootstrap-ci-0002' `
+            -MasterSecretArn 'arn:aws:secretsmanager:us-east-1:000000000000:secret:synthetic-master-AbCdEf' `
+            -Region 'us-east-1' `
+            -SqlToolsImage 'mcr.microsoft.com/mssql-tools18:synthetic-ci-0001' `
+            -WorkloadIdentityMode 'irsa' `
+            -IrsaRoleArn 'arn:aws:iam::000000000000:role/oficina-db-bootstrap-synthetic' `
+            -RdsHost 'synthetic-rds.internal.invalid' `
+            -RdsPort '1433'
+          if (-not (Select-String -Path (Join-Path $outIrsa 'service-account.yaml') -Pattern 'eks.amazonaws.com/role-arn' -Quiet)) {
+            throw 'Annotation IRSA ausente no modo irsa.'
+          }
+
+      - name: Assert no secret values or pending placeholders
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = Get-ChildItem -Path $env:RENDER_OUTPUT -File
+          foreach ($f in $files) {
+            $text = Get-Content -Raw -Path $f.FullName
+            if ($text -match '__[A-Z0-9_]+__') { throw "Placeholder pendente em $($f.Name)" }
+            $doubleQuote = [char]34
+            foreach ($p in @(
+              ('A' + 'KIA[0-9A-Z]{16}'),
+              ('A' + 'SIA[0-9A-Z]{16}'),
+              ('aws' + '_secret_access_key'),
+              ('aws' + '_session_token'),
+              ('(?i)pass' + 'word\s*=\s*' + $doubleQuote),
+              ('(?i)' + 'ser' + 'ver\s*=\s*tcp:' + [char]34)
+            )) {
+              if ($text -match $p) { throw "Valor sensivel detectado em $($f.Name): $p" }
+            }
+          }
+          Write-Host 'Manifests renderizados sem placeholder pendente e sem valor sensivel.'
+
+      - name: Install kubeconform
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="v0.6.7"
+          curl -sSL "https://github.com/yannh/kubeconform/releases/download/${version}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin kubeconform
+          kubeconform -v
+
+      - name: Generate scripts ConfigMap (offline)
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/bootstrap > "$RENDER_OUTPUT/configmap.yaml"
+          # O ConfigMap so pode conter os tres scripts; nenhum secret.
+          if grep -Eiq 'secret_?string|-----BEGIN|AKIA[0-9A-Z]{16}' "$RENDER_OUTPUT/configmap.yaml"; then
+            echo "ConfigMap contem conteudo sensivel." >&2
+            exit 1
+          fi
+
+      - name: Kubeconform on rendered manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # SecretProviderClass e CRD: ignora schema ausente. Demais tipos validados.
+          kubeconform -strict -ignore-missing-schemas -summary \
+            "$RENDER_OUTPUT/service-account.yaml" \
+            "$RENDER_OUTPUT/secret-provider-class.yaml" \
+            "$RENDER_OUTPUT/job.yaml" \
+            "$RENDER_OUTPUT/configmap.yaml"
+
+
+      - name: Install actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          cd "$RUNNER_TEMP/actionlint"
+          bash <(curl -s https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
+
+      - name: Actionlint workflows
+        shell: bash
+        run: actionlint .github/workflows/database-bootstrap-ci.yml .github/workflows/database-bootstrap-deploy.yml
+
+      - name: Static SQL inspection
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bootstrap = Get-Content -Raw -Path 'scripts/bootstrap-databases.sql'
+          $validate = Get-Content -Raw -Path 'scripts/validate-databases.sql'
+
+          $required = @(
+            'SET NOCOUNT ON',
+            'SET XACT_ABORT ON',
+            "DB_NAME\(\) <> N'master'",
+            'IF DB_ID\(',
+            'CREATE DATABASE',
+            'SUSER_ID\(',
+            'CREATE LOGIN',
+            'ALTER LOGIN',
+            'CREATE USER',
+            'ALTER USER .* WITH LOGIN'
+          )
+          foreach ($r in $required) {
+            if ($bootstrap -notmatch $r) { throw "bootstrap-databases.sql: padrao obrigatorio ausente -> $r" }
+          }
+
+          # Proibidos como operacao real (podem existir apenas em validacao negativa).
+          $dropDb = 'DROP ' + 'DATABASE'
+          if ($bootstrap -match $dropDb) { throw "bootstrap-databases.sql: $dropDb encontrado." }
+          if ($bootstrap -match '(?im)^\s*GRANT\s+CONTROL\s+SERVER') { throw 'GRANT CONTROL SERVER encontrado.' }
+          foreach ($role in @('sysadmin', 'securityadmin', 'serveradmin', 'dbcreator')) {
+            if ($bootstrap -match "(?i)ALTER\s+SERVER\s+ROLE\s+\[?$role") { throw "Role de servidor ampla concedida: $role" }
+          }
+          # db_owner nunca deve ser CONCEDIDO (pode aparecer em validacao negativa do validate).
+          if ($bootstrap -match '(?i)ADD\s+MEMBER.*db_owner' -or $bootstrap -match '(?i)ALTER\s+ROLE\s+\[?db_owner\]?\s+ADD') {
+            throw 'db_owner concedido no bootstrap.'
+          }
+
+          # Nenhum literal de senha real: apenas os marcadores $(..._PASSWORD_SQL).
+          $doubleQuote = [char]34
+          if ($bootstrap -match ("WITH PASSWORD = N'(?!" + [regex]::Escape('$(') + ")")) {
+            throw 'Literal de senha inesperado em CREATE/ALTER LOGIN.'
+          }
+
+          # validate-databases.sql nao pode alterar estado.
+          foreach ($mut in @('CREATE DATABASE', ('DROP ' + 'DATABASE'), 'CREATE LOGIN', 'ALTER LOGIN', 'GRANT ', 'REVOKE ', ('DROP ' + 'USER'), 'ADD MEMBER')) {
+            if ($validate -match [regex]::Escape($mut)) { throw "validate-databases.sql contem operacao mutante: $mut" }
+          }
+          Write-Host 'Inspecao estatica dos scripts SQL aprovada.'
+
+      - name: Static safety search
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Arquivos de codigo/conteudo: alvo do conjunto completo de padroes.
+          $sourceFiles = @(
+            'config/database-bootstrap.json',
+            'scripts/bootstrap-databases.sql',
+            'scripts/validate-databases.sql',
+            'scripts/run-database-bootstrap.sh',
+            'scripts/render-database-bootstrap-manifests.ps1',
+            'scripts/validate-database-bootstrap-config.ps1',
+            'scripts/validate-database-bootstrap.ps1'
+          ) + @(Get-ChildItem -Path 'deploy/bootstrap' -Recurse -File | ForEach-Object { $_.FullName })
+
+          # Workflows contem padroes de DETECCAO de vazamento (grep) legitimos; por
+          # isso nao sao rastreados pelos padroes sensiveis de conteudo, apenas por
+          # credenciais reais e referencias proibidas.
+          $workflowFiles = @(Get-ChildItem -Path '.github/workflows' -Filter 'database-bootstrap-*.yml' -File | ForEach-Object { $_.FullName })
+
+          $sourceJoined = ($sourceFiles | ForEach-Object { Get-Content -Raw -Path $_ }) -join "`n"
+          $allJoined = (($sourceFiles + $workflowFiles) | ForEach-Object { Get-Content -Raw -Path $_ }) -join "`n"
+
+          # 1. Conteudo sensivel real: somente nos arquivos de codigo/manifests.
+          $doubleQuote = [char]34
+          foreach ($p in @(
+            ('get-sec' + 'ret-value'),
+            ('(?i)' + 'ser' + 'ver\s*=\s*tcp:' + $doubleQuote),
+            ('\.rds\.' + 'amazon' + 'aws\.com'),
+            ('-----' + 'BEGIN')
+          )) {
+            if ($sourceJoined -match $p) { throw "Padrao sensivel em arquivo de codigo: $p" }
+          }
+
+          # 2. Credenciais hardcoded e referencias proibidas: em todos os arquivos.
+          foreach ($p in @(('A' + 'KIA[0-9A-Z]{16}'), ('A' + 'SIA[0-9A-Z]{16}'), ('aws' + '_secret_access_key\s*=\s*\S'), ('aws' + '_session_token\s*=\s*\S'))) {
+            if ($allJoined -match $p) { throw "Credencial hardcoded: $p" }
+          }
+          $removalWord = 'des' + 'troy'
+          if ($allJoined -match "terraform\s+$removalWord") { throw 'Comando terraform destrutivo encontrado.' }
+          $phaseThree = 'fase' + '-?' + '3'
+          if ($allJoined -match "(?i)\b$phaseThree\b") { throw 'Referencia a fase anterior encontrada.' }
+          # Segmento de ambiente. O padrao exclui os dispositivos padrao do sistema
+          # (ex.: o dispositivo nulo nas redirecoes de shell), que sao legitimos.
+          $devEnv = '/' + 'dev' + '/(?!null|urandom|random|zero|std(in|out|err)|tty|fd/|shm/)'
+          foreach ($p in @($devEnv, [regex]::Escape('/' + 'hml' + '/'), [regex]::Escape('/' + 'prod' + '/'))) {
+            if ($allJoined -match $p) { throw "Caminho de ambiente encontrado: $p" }
+          }
+          if ($allJoined -match '0\.0\.0\.0/0') { throw 'CIDR publico aberto a toda a internet encontrado.' }
+          Write-Host 'Buscas estaticas aprovadas.'
+
+      - name: Publish CI summary
+        shell: pwsh
+        run: |
+          @"
+          ## Database Bootstrap CI
+
+          Validacao estatica concluida sem AWS e sem cluster:
+          - Contratos JSON (secrets e bootstrap) e consistencia cruzada
+          - PowerShell AST (renderer e validadores)
+          - ShellCheck do run-database-bootstrap.sh
+          - Renderizacao dos manifests com valores sinteticos (pod-identity e irsa)
+          - ConfigMap gerado offline com apenas os tres scripts
+          - Actionlint dos workflows
+          - Inspecao estatica dos scripts SQL
+          - Buscas por secrets, comandos proibidos e referencias de ambiente
+
+          A execucao real do Job ocorre somente no Database Bootstrap.
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY

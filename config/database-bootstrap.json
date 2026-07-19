@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "namespace": "oficina",
+  "serviceAccountName": "db-bootstrap",
+  "jobNamePrefix": "oficina-db-bootstrap",
+  "configMapName": "oficina-db-bootstrap-scripts",
+  "secretProviderClassName": "oficina-db-bootstrap",
+  "rds": {
+    "endpointParameter": "/oficina/infra/rds/endpoint",
+    "portParameter": "/oficina/infra/rds/port",
+    "masterSecretArnParameter": "/oficina/infra/rds/master-secret-arn"
+  },
+  "cluster": {
+    "nameParameter": "/oficina/infra/cluster/name"
+  },
+  "secrets": {
+    "cadastroRuntime": "/oficina/cadastro/runtime-db",
+    "cadastroMigration": "/oficina/cadastro/migration-db",
+    "estoqueRuntime": "/oficina/estoque/runtime-db",
+    "estoqueMigration": "/oficina/estoque/migration-db",
+    "ordensRuntime": "/oficina/ordens/runtime-db",
+    "ordensMigration": "/oficina/ordens/migration-db",
+    "authDatabase": "/oficina/auth/database"
+  },
+  "databases": [
+    {
+      "name": "OficinaCadastroDb",
+      "runtimeLogin": "cadastro_app",
+      "migratorLogin": "cadastro_migrator",
+      "readOnlyLogins": [
+        "auth_read"
+      ]
+    },
+    {
+      "name": "OficinaEstoqueDb",
+      "runtimeLogin": "estoque_app",
+      "migratorLogin": "estoque_migrator",
+      "readOnlyLogins": []
+    },
+    {
+      "name": "OficinaOrdensServicoDb",
+      "runtimeLogin": "ordens_app",
+      "migratorLogin": "ordens_migrator",
+      "readOnlyLogins": []
+    }
+  ],
+  "job": {
+    "backoffLimit": 0,
+    "activeDeadlineSeconds": 900,
+    "ttlSecondsAfterFinished": 1800
+  }
+}

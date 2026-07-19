@@ -31,6 +31,10 @@ override.tf.json
 
 # Include tfplan files to ignore the plan output of command: terraform plan -out=tfplan
 # example: *tfplan*
+*.tfplan
+
+# Local backend configuration generated from the example file
+backend-config.hcl
 
 # Ignore CLI configuration files
 .terraformrc
@@ -42,3 +46,19 @@ terraform.rc
 # Optional: ignore plan files saved before destroying Terraform configuration
 # Uncomment the line below if you want to ignore planout files.
 # planout
+/.vs
+
+# Database secrets sync: temporary payloads must never be committed.
+# The sync script uses the system temp directory, never a repository folder.
+.secrets-tmp/
+*.secret-payload.json
+database-secrets.local.json
+
+# Database bootstrap: manifests renderizados, ConfigMap gerado e logs do Job
+# sao artefatos efemeros da pipeline; nunca versionar.
+rendered/
+*.rendered.sql
+*.rendered.yaml
+job.log
+kubeconfig
+

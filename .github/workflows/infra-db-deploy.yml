@@ -1,0 +1,209 @@
+name: Infra DB Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Digite APPLY para confirmar o provisionamento da VPC e do RDS.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infra-db
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Provision VPC and RDS
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate branch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REF -ne 'refs/heads/main') {
+            throw 'Este workflow deve ser executado somente na branch main.'
+          }
+
+      - name: Validate confirmation
+        shell: pwsh
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:CONFIRMATION -cne 'APPLY') {
+            throw 'Confirmacao invalida. Digite exatamente APPLY.'
+          }
+
+      - name: Validate repository variables
+        shell: pwsh
+        env:
+          AWS_REGION_VALUE: ${{ vars.AWS_REGION }}
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          TF_STATE_REGION: ${{ vars.TF_STATE_REGION }}
+          TF_STATE_KEY_INFRA_DB: ${{ vars.TF_STATE_KEY_INFRA_DB }}
+          VPC_CIDR: ${{ vars.VPC_CIDR }}
+          RDS_DATABASE_PORT: ${{ vars.RDS_DATABASE_PORT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @('AWS_REGION_VALUE', 'TF_STATE_BUCKET', 'TF_STATE_REGION', 'TF_STATE_KEY_INFRA_DB')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Repository Variable obrigatoria vazia: $name"
+            }
+          }
+          if ($env:AWS_REGION_VALUE -ne $env:TF_STATE_REGION) {
+            throw 'AWS_REGION e TF_STATE_REGION devem ter o mesmo valor.'
+          }
+          if ($env:TF_STATE_KEY_INFRA_DB -ne 'oficina/infra-db/terraform.tfstate') {
+            Write-Warning "TF_STATE_KEY_INFRA_DB diferente do planejado: $env:TF_STATE_KEY_INFRA_DB"
+            $phaseThree = 'fase' + '-?' + '3'
+            $devPath = '/' + 'dev' + '/'
+            $devSuffixPattern = '-' + 'dev'
+            if ($env:TF_STATE_KEY_INFRA_DB -match "(?i)$phaseThree" -or $env:TF_STATE_KEY_INFRA_DB -match [regex]::Escape($devPath) -or $env:TF_STATE_KEY_INFRA_DB -match [regex]::Escape($devSuffixPattern)) {
+              throw 'TF_STATE_KEY_INFRA_DB nao pode referenciar fase anterior ou caminho temporario.'
+            }
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:VPC_CIDR) -and $env:VPC_CIDR -notmatch '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$') {
+            throw 'VPC_CIDR invalido.'
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:RDS_DATABASE_PORT)) {
+            $port = [int]$env:RDS_DATABASE_PORT
+            if ($port -lt 1 -or $port -gt 65535) { throw 'RDS_DATABASE_PORT deve estar entre 1 e 65535.' }
+          }
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Validate AWS identity
+        shell: pwsh
+        run: aws sts get-caller-identity
+
+      - name: Validate backend bucket
+        shell: pwsh
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          TF_STATE_REGION: ${{ vars.TF_STATE_REGION }}
+        run: ./scripts/validate-terraform-backend.ps1 -BucketName $env:TF_STATE_BUCKET -Region $env:TF_STATE_REGION
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Terraform fmt
+        working-directory: terraform/infra-db
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init with remote backend
+        working-directory: terraform/infra-db
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          TF_STATE_REGION: ${{ vars.TF_STATE_REGION }}
+          TF_STATE_KEY_INFRA_DB: ${{ vars.TF_STATE_KEY_INFRA_DB }}
+        run: |
+          terraform init \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=$TF_STATE_KEY_INFRA_DB" \
+            -backend-config="region=$TF_STATE_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform validate
+        working-directory: terraform/infra-db
+        run: terraform validate
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+
+      - name: TFLint
+        working-directory: terraform/infra-db
+        run: tflint --init && tflint
+
+      - name: Checkov focused security scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform/infra-db
+          framework: terraform
+          check: CKV_AWS_16,CKV_AWS_17,CKV_AWS_23,CKV_AWS_24
+          quiet: true
+
+      - name: Export Terraform variables
+        shell: pwsh
+        working-directory: terraform/infra-db
+        env:
+          AWS_REGION_VALUE: ${{ vars.AWS_REGION }}
+          VPC_CIDR: ${{ vars.VPC_CIDR }}
+          RDS_DATABASE_PORT: ${{ vars.RDS_DATABASE_PORT }}
+          RDS_ENGINE: ${{ vars.RDS_ENGINE }}
+          RDS_INSTANCE_CLASS: ${{ vars.RDS_INSTANCE_CLASS }}
+          RDS_ALLOCATED_STORAGE: ${{ vars.RDS_ALLOCATED_STORAGE }}
+          RDS_STORAGE_TYPE: ${{ vars.RDS_STORAGE_TYPE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          "TF_VAR_aws_region=$env:AWS_REGION_VALUE" | Add-Content -Path $env:GITHUB_ENV
+          if (-not [string]::IsNullOrWhiteSpace($env:VPC_CIDR)) { "TF_VAR_vpc_cidr=$env:VPC_CIDR" | Add-Content -Path $env:GITHUB_ENV }
+          if (-not [string]::IsNullOrWhiteSpace($env:RDS_DATABASE_PORT)) { "TF_VAR_rds_port=$env:RDS_DATABASE_PORT" | Add-Content -Path $env:GITHUB_ENV }
+          if (-not [string]::IsNullOrWhiteSpace($env:RDS_ENGINE)) { "TF_VAR_rds_engine=$env:RDS_ENGINE" | Add-Content -Path $env:GITHUB_ENV }
+          if (-not [string]::IsNullOrWhiteSpace($env:RDS_INSTANCE_CLASS)) { "TF_VAR_rds_instance_class=$env:RDS_INSTANCE_CLASS" | Add-Content -Path $env:GITHUB_ENV }
+          if (-not [string]::IsNullOrWhiteSpace($env:RDS_ALLOCATED_STORAGE)) { "TF_VAR_rds_allocated_storage=$env:RDS_ALLOCATED_STORAGE" | Add-Content -Path $env:GITHUB_ENV }
+          if (-not [string]::IsNullOrWhiteSpace($env:RDS_STORAGE_TYPE)) { "TF_VAR_rds_storage_type=$env:RDS_STORAGE_TYPE" | Add-Content -Path $env:GITHUB_ENV }
+
+      - name: Terraform plan
+        working-directory: terraform/infra-db
+        run: terraform plan -out=tfplan
+
+      - name: Publish sanitized plan summary
+        shell: bash
+        working-directory: terraform/infra-db
+        run: |
+          set -euo pipefail
+          terraform show -no-color tfplan > plan.txt
+          {
+            echo "## Infra DB Terraform Plan"
+            echo
+            grep -E "Plan:|aws_vpc|aws_subnet|aws_nat_gateway|aws_db_instance|aws_secretsmanager_secret|aws_ssm_parameter" plan.txt | head -n 80 || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform apply from generated plan
+        working-directory: terraform/infra-db
+        run: terraform apply tfplan
+
+      - name: Read-only post-apply validation
+        shell: pwsh
+        env:
+          AWS_REGION_VALUE: ${{ vars.AWS_REGION }}
+          VPC_CIDR: ${{ vars.VPC_CIDR }}
+          RDS_DATABASE_PORT: ${{ vars.RDS_DATABASE_PORT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cidr = if ([string]::IsNullOrWhiteSpace($env:VPC_CIDR)) { '10.40.0.0/16' } else { $env:VPC_CIDR }
+          ./scripts/validate-infra-db.ps1 -Region $env:AWS_REGION_VALUE -ExpectedVpcCidr $cidr
+
+      - name: Publish final summary
+        shell: pwsh
+        run: |
+          @"
+          ## Infra DB Deploy
+
+          Status final: validacao pos-apply concluida.
+
+          Recursos esperados:
+          - VPC privada da stack Oficina
+          - 2 subnets publicas e 2 privadas
+          - 1 Internet Gateway e 1 NAT Gateway
+          - RDS SQL Server privado, criptografado e sem ingresso publico
+          - Containers vazios no Secrets Manager
+          - Parametros nao sensiveis no SSM Parameter Store
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY

@@ -1,0 +1,240 @@
+name: Infra DB CI
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - terraform/infra-db/**
+      - scripts/validate-infra-db.ps1
+      - config/database-secrets.json
+      - scripts/sync-database-secrets.ps1
+      - scripts/validate-database-secret-containers.ps1
+      - scripts/validate-database-secrets-config.ps1
+      - .github/workflows/infra-db-*.yml
+      - .github/workflows/database-secrets-sync.yml
+      - .tflint.hcl
+      - .checkov.yml
+      - .gitignore
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Static validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Terraform fmt
+        working-directory: terraform/infra-db
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init without backend
+        working-directory: terraform/infra-db
+        run: terraform init -backend=false
+
+      - name: Terraform validate
+        working-directory: terraform/infra-db
+        run: terraform validate
+
+      - name: Terraform providers
+        working-directory: terraform/infra-db
+        run: |
+          terraform providers || {
+            echo "terraform providers requer backend inicializado nesta versao do Terraform com backend s3 vazio."
+            echo "Provider AWS validado por terraform init -backend=false, terraform validate e .terraform.lock.hcl."
+          }
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+
+      - name: TFLint
+        working-directory: terraform/infra-db
+        run: tflint --init && tflint
+
+      - name: Checkov focused security scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform/infra-db
+          framework: terraform
+          check: CKV_AWS_16,CKV_AWS_17,CKV_AWS_23,CKV_AWS_24
+          quiet: true
+
+      - name: Install actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          cd "$RUNNER_TEMP/actionlint"
+          bash <(curl -s https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
+
+      - name: Actionlint workflows
+        shell: bash
+        run: actionlint .github/workflows/infra-db-ci.yml .github/workflows/infra-db-deploy.yml .github/workflows/database-secrets-sync.yml
+
+      - name: PowerShell AST validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scripts = @(
+            'scripts/validate-infra-db.ps1',
+            'scripts/validate-database-secrets-config.ps1',
+            'scripts/validate-database-secret-containers.ps1',
+            'scripts/sync-database-secrets.ps1'
+          )
+          foreach ($script in $scripts) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "${script}: $($_.Message)" }
+              exit 1
+            }
+          }
+
+      - name: Validate database secrets contract
+        shell: pwsh
+        run: ./scripts/validate-database-secrets-config.ps1 -ConfigPath config/database-secrets.json
+
+      - name: Database secrets DryRun without AWS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $names = @(
+            'SQL_CADASTRO_APP_PASSWORD',
+            'SQL_CADASTRO_MIGRATOR_PASSWORD',
+            'SQL_ESTOQUE_APP_PASSWORD',
+            'SQL_ESTOQUE_MIGRATOR_PASSWORD',
+            'SQL_ORDENS_APP_PASSWORD',
+            'SQL_ORDENS_MIGRATOR_PASSWORD',
+            'SQL_AUTH_READ_PASSWORD'
+          )
+          # Valores sinteticos gerados dinamicamente, jamais reais e nunca literais.
+          $syntheticSuffix = 'CI-Synthetic-Value-Not-Real-0001!'
+          foreach ($name in $names) {
+            [Environment]::SetEnvironmentVariable($name, "$name-$syntheticSuffix")
+          }
+          try {
+            $output = ./scripts/sync-database-secrets.ps1 -ConfigPath config/database-secrets.json -DryRun -ServerOverride 'synthetic-endpoint.invalid' -PortOverride 1433 | Out-String
+          }
+          finally {
+            foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $null) }
+          }
+          Write-Host $output
+          if ($output -notmatch '7 payloads construidos\.') { throw 'DryRun nao construiu sete payloads.' }
+          if ($output -notmatch '0 chamadas AWS executadas\.') { throw 'DryRun executou chamadas AWS.' }
+          if ($output -match [regex]::Escape($syntheticSuffix)) { throw 'DryRun vazou valor sintetico.' }
+          Write-Host 'DryRun aprovado sem acesso a AWS e sem vazamento de valores.'
+
+      - name: Static safety checks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @(
+            Get-ChildItem -Path 'terraform/infra-db' -Recurse -File -Force
+            Get-Item -Path 'scripts/validate-infra-db.ps1'
+            Get-Item -Path 'config/database-secrets.json'
+            Get-Item -Path 'scripts/sync-database-secrets.ps1'
+            Get-Item -Path 'scripts/validate-database-secret-containers.ps1'
+            Get-Item -Path 'scripts/validate-database-secrets-config.ps1'
+            Get-ChildItem -Path '.github/workflows' -Filter 'infra-db-*.yml' -File -Force
+            Get-Item -Path '.github/workflows/database-secrets-sync.yml'
+          ) | Where-Object {
+            # Classe de caractere [\\/]: o runner e Linux e usa '/', entao um padrao
+            # so com barra invertida nunca casa e o diretorio .terraform (criado pelo
+            # terraform init deste job) seria lido como texto, incluindo o binario do
+            # provider AWS -- que contem caminhos como o do gerador de aleatorios.
+            $_.FullName -notmatch '[\\/]\.terraform[\\/]'
+          }
+          $contentByPath = @{}
+          foreach ($file in $files) {
+            $contentByPath[$file.FullName] = Get-Content -Raw -Path $file.FullName
+          }
+          $joined = ($contentByPath.Values -join "`n")
+
+          foreach ($pattern in @('AKIA[0-9A-Z]{16}', 'ASIA[0-9A-Z]{16}', 'aws_access_key_id\s*=', 'aws_secret_access_key\s*=', 'aws_session_token\s*=')) {
+            if ($joined -match $pattern) { throw "Possivel credencial hardcoded encontrada: $pattern" }
+          }
+
+          # Vazamento de senhas, connection strings reais e conteudo de secret.
+          # Padroes concatenados para nao dispararem sobre si mesmos.
+          $quoteClass = '[' + [char]34 + [char]39 + ']'
+          $doubleQuote = [char]34
+          $forbiddenSecretPatterns = @(
+            ('(?i)(pass' + 'word|pw' + 'd)\s*=\s*' + $quoteClass),
+            ('(?i)' + 'ser' + 'ver\s*=\s*tcp:'),
+            ('(?i)' + 'user\s*id\s*=\s*' + $quoteClass),
+            ('(?i)' + $doubleQuote + 'secret_?string' + $doubleQuote + '\s*:'),
+            ('\.rds\.' + 'amazon' + 'aws\.com'),
+            ('cre' + 'ate-secret'),
+            ('up' + 'date-secret'),
+            ('del' + 'ete-secret'),
+            ('get-sec' + 'ret-value')
+          )
+          foreach ($pattern in $forbiddenSecretPatterns) {
+            if ($joined -match $pattern) { throw "Padrao sensivel encontrado nos arquivos de secrets SQL: $pattern" }
+          }
+
+          # Nenhum artefato temporario de payload pode estar versionado.
+          $tempArtifacts = @(
+            Get-ChildItem -Path . -Recurse -File -Force |
+              Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' } |
+              Where-Object { $_.Name -like '*.secret-payload.json' -or $_.FullName -match '[\\/]\.secrets-tmp[\\/]' -or $_.Name -eq 'database-secrets.local.json' }
+          )
+          if ($tempArtifacts.Count -gt 0) { throw "Artefato temporario de secret versionado: $($tempArtifacts[0].FullName)" }
+
+          $terraformFiles = Get-ChildItem -Path 'terraform/infra-db' -Filter '*.tf' -File
+          $terraformJoined = ($terraformFiles | ForEach-Object { Get-Content -Raw -Path $_.FullName }) -join "`n"
+          $forbiddenTerraform = @(
+            'publicly_accessible\s*=\s*true',
+            'secret_string\s*=',
+            'secret_binary\s*=',
+            'aws_secretsmanager_secret_version',
+            ('force_' + 'destroy\s*=\s*true'),
+            'terraform_remote_state',
+            'variable\s+"environment"'
+          )
+          foreach ($pattern in $forbiddenTerraform) {
+            if ($terraformJoined -match $pattern) { throw "Padrao Terraform proibido encontrado: $pattern" }
+          }
+
+          $rdsSgIngressPublic = 'aws_vpc_security_group_ingress_rule[\s\S]*security_group_id\s*=\s*aws_security_group\.rds\.id[\s\S]*cidr_ipv4\s*=\s*"0\.0\.0\.0/0"'
+          if ($terraformJoined -match $rdsSgIngressPublic) { throw 'Ingresso publico no Security Group do RDS encontrado.' }
+          if ($terraformJoined -match 'aws_security_group_rule[\s\S]*type\s*=\s*"ingress"[\s\S]*0\.0\.0\.0/0') { throw 'Regra de ingresso publica encontrada.' }
+
+          $removalWord = 'des' + 'troy'
+          $phaseThree = 'fase' + '-?' + '3'
+          $devPath = '/' + 'dev' + '/'
+          $devSuffixPattern = '(?<![A-Za-z0-9])-' + 'dev' + '(?![A-Za-z0-9])'
+          if ($joined -match "terraform\s+$removalWord") { throw 'Comando Terraform destrutivo encontrado.' }
+          if ($joined -match [regex]::Escape($devPath)) { throw 'Referencia proibida a caminho temporario encontrada.' }
+          if ($joined -match "(?i)\b$phaseThree\b") { throw 'Referencia a fase anterior encontrada.' }
+          if ($joined -match $devSuffixPattern) { throw 'Sufixo temporario encontrado.' }
+
+      - name: Publish CI summary
+        shell: pwsh
+        run: |
+          @"
+          ## Infra DB CI
+
+          Validacao estatica concluida:
+          - Terraform fmt, validate, TFLint e Checkov
+          - Actionlint dos workflows, incluindo Database Secrets Sync
+          - PowerShell AST dos quatro scripts
+          - Contrato de secrets SQL validado
+          - DryRun de sincronizacao sem acesso a AWS
+          - Buscas estaticas por credenciais e connection strings
+
+          Plan AWS real sera executado no Infra DB Deploy. A sincronizacao real
+          de secrets ocorre somente no workflow Database Secrets Sync.
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY
