@@ -15,6 +15,9 @@ param(
     [string]$ExpectedVpcCidr = "10.40.0.0/16",
 
     [Parameter(Mandatory = $false)]
+    [string]$RdsAdminCidr,
+
+    [Parameter(Mandatory = $false)]
     [string[]]$ExpectedSecretNames = @(
         "/oficina/cadastro/runtime-db",
         "/oficina/cadastro/migration-db",
@@ -227,15 +230,21 @@ if (@($rds).Count -eq 1) {
     ) + $sgIds + @('--output', 'json')
     $sgJson = ConvertFrom-JsonOutput -Text (Invoke-AwsReadOnly -Arguments $sgArguments).Output
     $public1433 = $false
+    $adminCidr1433 = $false
     foreach ($sg in @($sgJson.SecurityGroups)) {
         foreach ($permission in @($sg.IpPermissions)) {
             $fromPort = if ($null -eq $permission.FromPort) { -1 } else { [int]$permission.FromPort }
             $toPort = if ($null -eq $permission.ToPort) { -1 } else { [int]$permission.ToPort }
             $hasPublicCidr = @($permission.IpRanges | Where-Object { $_.CidrIp -eq '0.0.0.0/0' }).Count -gt 0
+            $hasAdminCidr = -not [string]::IsNullOrWhiteSpace($RdsAdminCidr) -and @($permission.IpRanges | Where-Object { $_.CidrIp -eq $RdsAdminCidr }).Count -gt 0
             if ($fromPort -le 1433 -and $toPort -ge 1433 -and $hasPublicCidr) { $public1433 = $true }
+            if ($fromPort -le 1433 -and $toPort -ge 1433 -and $hasAdminCidr) { $adminCidr1433 = $true }
         }
     }
     Add-Check -Checks $checks -Name 'Porta 1433 nao publica' -Expected 'Sem ingresso 0.0.0.0/0' -Actual $(if ($public1433) { 'Exposta' } else { 'Nao exposta' }) -Passed (-not $public1433)
+    if (-not [string]::IsNullOrWhiteSpace($RdsAdminCidr)) {
+        Add-Check -Checks $checks -Name 'CIDR admin SSMS' -Expected 'Regra 1433 presente' -Actual $(if ($adminCidr1433) { 'Configurada' } else { 'Ausente' }) -Passed $adminCidr1433
+    }
 }
 
 $subnetGroup = ConvertFrom-JsonOutput -Text (Invoke-AwsReadOnly -Arguments @(

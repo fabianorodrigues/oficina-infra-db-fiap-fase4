@@ -118,6 +118,26 @@ variable "rds_master_username" {
   }
 }
 
+variable "rds_admin_cidr" {
+  description = "Optional IPv4 CIDR allowed to reach SQL Server from SSMS through an existing path to the VPC. Leave empty to omit this ingress rule."
+  type        = string
+  default     = ""
+  sensitive   = true
+
+  validation {
+    condition = trimspace(nonsensitive(var.rds_admin_cidr)) == "" || (
+      can(cidrnetmask(trimspace(nonsensitive(var.rds_admin_cidr)))) &&
+      can(regex("^([0-9]{1,3}\\.){3}[0-9]{1,3}/(2[4-9]|3[0-2])$", trimspace(nonsensitive(var.rds_admin_cidr))))
+    )
+    error_message = "rds_admin_cidr must be empty or an IPv4 CIDR from /24 to /32. Use /32 for a single SSMS client IP."
+  }
+
+  validation {
+    condition     = trimspace(nonsensitive(var.rds_admin_cidr)) != "0.0.0.0/0"
+    error_message = "rds_admin_cidr must never be 0.0.0.0/0."
+  }
+}
+
 variable "common_tags" {
   description = "Additional non-environment tags to merge into all taggable resources."
   type        = map(string)

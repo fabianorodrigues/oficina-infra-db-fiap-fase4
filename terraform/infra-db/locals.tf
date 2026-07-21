@@ -14,6 +14,9 @@ locals {
   public_subnet_cidrs  = [for index in range(var.availability_zone_count) : cidrsubnet(var.vpc_cidr, 8, index)]
   private_subnet_cidrs = [for index in range(var.availability_zone_count) : cidrsubnet(var.vpc_cidr, 8, index + var.availability_zone_count)]
 
+  rds_admin_cidr           = trimspace(var.rds_admin_cidr)
+  rds_admin_access_enabled = trimspace(nonsensitive(var.rds_admin_cidr)) != ""
+
   database_secret_names = toset([
     "/oficina/cadastro/runtime-db",
     "/oficina/cadastro/migration-db",
