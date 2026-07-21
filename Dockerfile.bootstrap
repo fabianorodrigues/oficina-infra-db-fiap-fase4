@@ -1,0 +1,11 @@
+ARG SQL_TOOLS_IMAGE
+FROM ${SQL_TOOLS_IMAGE}
+
+WORKDIR /opt/bootstrap
+COPY scripts/run-database-bootstrap.sh /opt/bootstrap/run-database-bootstrap.sh
+COPY scripts/bootstrap-databases.sql /opt/bootstrap/scripts/bootstrap-databases.sql
+COPY scripts/validate-databases.sql /opt/bootstrap/scripts/validate-databases.sql
+
+RUN chmod +x /opt/bootstrap/run-database-bootstrap.sh
+
+ENTRYPOINT ["/opt/bootstrap/run-database-bootstrap.sh"]

@@ -2,10 +2,10 @@
 # =============================================================================
 # run-database-bootstrap.sh
 # -----------------------------------------------------------------------------
-# Executado dentro do Kubernetes Job db-bootstrap. Le a identidade master e as
-# sete senhas funcionais a partir do volume CSI (Secrets Store CSI Driver +
-# ASCP), renderiza o SQL de bootstrap em um arquivo temporario em RAM, conecta
-# ao RDS SQL Server com conexao criptografada e executa o bootstrap e a
+# Executado dentro de uma ECS Run Task. Le a identidade master e as sete senhas
+# funcionais a partir de variaveis de ambiente injetadas pelo ECS a partir do
+# Secrets Manager, renderiza o SQL de bootstrap em um arquivo temporario em RAM,
+# conecta ao RDS SQL Server com conexao criptografada e executa o bootstrap e a
 # validacao idempotentes.
 #
 # Regras de seguranca:
@@ -28,7 +28,6 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 # Configuracao (nao sensivel). Sobrescrevivel por variavel de ambiente.
 # -----------------------------------------------------------------------------
-SECRETS_DIR="${SECRETS_DIR:-/mnt/secrets}"
 SCRIPTS_DIR="${SCRIPTS_DIR:-/opt/bootstrap/scripts}"
 WORK_DIR="${WORK_DIR:-/work}"
 SQL_ENCRYPT_TRUST_SERVER_CERT="${SQL_ENCRYPT_TRUST_SERVER_CERT:-true}"
@@ -81,21 +80,23 @@ case "$RDS_PORT" in
 esac
 
 # -----------------------------------------------------------------------------
-# 2. Leitura segura de um arquivo montado, rejeitando CR, LF e NUL.
-#    Ecoa o conteudo em stdout apenas para captura por command substitution;
-#    o valor jamais e impresso.
+# 2. Leitura segura de variavel de ambiente ou arquivo local opcional,
+#    rejeitando CR, LF e NUL. O valor jamais e impresso.
 # -----------------------------------------------------------------------------
-read_secret_file() {
-    local file="$1"
-    local label="$2"
-    [ -f "$file" ] || fail "Arquivo montado ausente: ${label}"
-    [ -s "$file" ] || fail "Arquivo montado vazio: ${label}"
+read_secret_value() {
+    local env_name="$1"
+    local fallback_file="${2:-}"
+    local label="$3"
+    local value="${!env_name:-}"
+    if [ -z "$value" ] && [ -n "$fallback_file" ]; then
+        [ -f "$fallback_file" ] || fail "Secret ausente: ${label}"
+        [ -s "$fallback_file" ] || fail "Secret vazio: ${label}"
+        value="$(<"$fallback_file")"
+    fi
+    [ -n "$value" ] || fail "Secret ausente ou vazio: ${label}"
     local bad
-    bad="$(LC_ALL=C tr -cd '\r\n\000' < "$file" | wc -c | tr -d '[:space:]')"
+    bad="$(printf '%s' "$value" | LC_ALL=C tr -cd '\r\n\000' | wc -c | tr -d '[:space:]')"
     [ "$bad" = "0" ] || fail "Valor de ${label} contem CR, LF ou NUL."
-    local value
-    value="$(<"$file")"
-    [ -n "$value" ] || fail "Valor de ${label} vazio apos leitura."
     printf '%s' "$value"
 }
 
@@ -105,17 +106,17 @@ escape_tsql() {
     printf '%s' "${raw//\'/\'\'}"
 }
 
-log "Validando arquivos montados pelo CSI..."
-MASTER_USER="$(read_secret_file "${SECRETS_DIR}/master-username" 'master-username')"
-MASTER_PASSWORD="$(read_secret_file "${SECRETS_DIR}/master-password" 'master-password')"
+log "Validando secrets injetados no ambiente..."
+MASTER_USER="$(read_secret_value MASTER_USERNAME "${SECRETS_DIR:-}/master-username" 'master-username')"
+MASTER_PASSWORD="$(read_secret_value MASTER_PASSWORD "${SECRETS_DIR:-}/master-password" 'master-password')"
 
-CADASTRO_APP_RAW="$(read_secret_file "${SECRETS_DIR}/cadastro-app-password" 'cadastro-app-password')"
-CADASTRO_MIGRATOR_RAW="$(read_secret_file "${SECRETS_DIR}/cadastro-migrator-password" 'cadastro-migrator-password')"
-ESTOQUE_APP_RAW="$(read_secret_file "${SECRETS_DIR}/estoque-app-password" 'estoque-app-password')"
-ESTOQUE_MIGRATOR_RAW="$(read_secret_file "${SECRETS_DIR}/estoque-migrator-password" 'estoque-migrator-password')"
-ORDENS_APP_RAW="$(read_secret_file "${SECRETS_DIR}/ordens-app-password" 'ordens-app-password')"
-ORDENS_MIGRATOR_RAW="$(read_secret_file "${SECRETS_DIR}/ordens-migrator-password" 'ordens-migrator-password')"
-AUTH_READ_RAW="$(read_secret_file "${SECRETS_DIR}/auth-read-password" 'auth-read-password')"
+CADASTRO_APP_RAW="$(read_secret_value CADASTRO_APP_PASSWORD "${SECRETS_DIR:-}/cadastro-app-password" 'cadastro-app-password')"
+CADASTRO_MIGRATOR_RAW="$(read_secret_value CADASTRO_MIGRATOR_PASSWORD "${SECRETS_DIR:-}/cadastro-migrator-password" 'cadastro-migrator-password')"
+ESTOQUE_APP_RAW="$(read_secret_value ESTOQUE_APP_PASSWORD "${SECRETS_DIR:-}/estoque-app-password" 'estoque-app-password')"
+ESTOQUE_MIGRATOR_RAW="$(read_secret_value ESTOQUE_MIGRATOR_PASSWORD "${SECRETS_DIR:-}/estoque-migrator-password" 'estoque-migrator-password')"
+ORDENS_APP_RAW="$(read_secret_value ORDENS_APP_PASSWORD "${SECRETS_DIR:-}/ordens-app-password" 'ordens-app-password')"
+ORDENS_MIGRATOR_RAW="$(read_secret_value ORDENS_MIGRATOR_PASSWORD "${SECRETS_DIR:-}/ordens-migrator-password" 'ordens-migrator-password')"
+AUTH_READ_RAW="$(read_secret_value AUTH_READ_PASSWORD "${SECRETS_DIR:-}/auth-read-password" 'auth-read-password')"
 
 # -----------------------------------------------------------------------------
 # 3. Escape T-SQL das sete senhas funcionais.

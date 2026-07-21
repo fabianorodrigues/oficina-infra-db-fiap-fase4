@@ -7,11 +7,9 @@ resource "aws_subnet" "public" {
   map_public_ip_on_launch = true
 
   tags = merge(local.common_tags, {
-    Name                            = "${var.project_name}-public-${count.index + 1}"
-    Component                       = "network"
-    Type                            = "public"
-    "kubernetes.io/role/elb"        = "1"
-    "kubernetes.io/cluster/oficina" = "shared"
+    Name      = "${var.project_name}-public-${count.index + 1}"
+    Component = "network"
+    Type      = "public"
   })
 }
 
@@ -24,10 +22,8 @@ resource "aws_subnet" "private" {
   map_public_ip_on_launch = false
 
   tags = merge(local.common_tags, {
-    Name                              = "${var.project_name}-private-${count.index + 1}"
-    Component                         = "network"
-    Type                              = "private"
-    "kubernetes.io/role/internal-elb" = "1"
-    "kubernetes.io/cluster/oficina"   = "shared"
+    Name      = "${var.project_name}-private-${count.index + 1}"
+    Component = "network"
+    Type      = "private"
   })
 }
