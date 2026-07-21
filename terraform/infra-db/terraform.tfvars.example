@@ -8,3 +8,4 @@ rds_allocated_storage = 20
 rds_storage_type      = "gp3"
 rds_port              = 1433
 rds_master_username   = "oficina_admin"
+rds_admin_cidr        = ""

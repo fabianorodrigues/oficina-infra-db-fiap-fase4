@@ -31,6 +31,7 @@ jobs:
       SQL_ORDENS_APP_PASSWORD: ${{ secrets.SQL_ORDENS_APP_PASSWORD }}
       SQL_ORDENS_MIGRATOR_PASSWORD: ${{ secrets.SQL_ORDENS_MIGRATOR_PASSWORD }}
       SQL_AUTH_READ_PASSWORD: ${{ secrets.SQL_AUTH_READ_PASSWORD }}
+      RDS_ADMIN_CIDR: ${{ secrets.RDS_ADMIN_CIDR }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -60,6 +61,9 @@ jobs:
           $missing = @($secretNames | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
           if ($missing.Count -gt 0) {
             throw "Missing Repository Secrets: $($missing -join ', ')"
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:RDS_ADMIN_CIDR)) {
+            Write-Host 'Optional RDS admin CIDR is configured. The SQL Server security group will allow port 1433 from that CIDR.'
           }
 
       - name: Configure AWS credentials
@@ -128,7 +132,13 @@ jobs:
           quiet: true
 
       - name: Export Terraform variables
-        run: echo "TF_VAR_aws_region=${AWS_REGION}" >> "$GITHUB_ENV"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          "TF_VAR_aws_region=$env:AWS_REGION" | Add-Content -Path $env:GITHUB_ENV
+          if (-not [string]::IsNullOrWhiteSpace($env:RDS_ADMIN_CIDR)) {
+            "TF_VAR_rds_admin_cidr=$($env:RDS_ADMIN_CIDR.Trim())" | Add-Content -Path $env:GITHUB_ENV
+          }
 
       - name: Terraform plan
         working-directory: terraform/infra-db
@@ -162,7 +172,13 @@ jobs:
 
       - name: Validate infrastructure
         shell: pwsh
-        run: ./scripts/validate-infra-db.ps1 -Region $env:AWS_REGION -ExpectedVpcCidr '10.40.0.0/16'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $arguments = @('-Region', $env:AWS_REGION, '-ExpectedVpcCidr', '10.40.0.0/16')
+          if (-not [string]::IsNullOrWhiteSpace($env:RDS_ADMIN_CIDR)) {
+            $arguments += @('-RdsAdminCidr', $env:RDS_ADMIN_CIDR.Trim())
+          }
+          ./scripts/validate-infra-db.ps1 @arguments
 
       - name: Validate secrets contract
         shell: pwsh
@@ -185,6 +201,12 @@ jobs:
         run: |
           $config = Get-Content -LiteralPath 'config/database-secrets.json' -Raw | ConvertFrom-Json
           $secretNames = @($config.targets | ForEach-Object { $_.secretName })
+          $rdsAccess = if ([string]::IsNullOrWhiteSpace($env:RDS_ADMIN_CIDR)) {
+            '- Private SQL Server RDS'
+          }
+          else {
+            '- Private SQL Server RDS with optional 1433 admin ingress restricted to the configured CIDR'
+          }
           $lines = @(
             '## Database Infrastructure Deploy',
             '',
@@ -196,7 +218,7 @@ jobs:
             'Provisioned and validated:',
             '- Terraform backend',
             '- VPC, subnets, routing and NAT',
-            '- Private SQL Server RDS',
+            $rdsAccess,
             '- Non-sensitive SSM parameters',
             '- SQL secret containers',
             '- SQL secret AWSCURRENT versions',

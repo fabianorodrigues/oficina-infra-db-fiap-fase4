@@ -146,6 +146,28 @@ Configure em **Settings → Secrets and variables → Actions** do repositório.
 
 O deploy verifica a presença das 7 senhas antes de iniciar e falha listando as que faltarem. Use senhas que atendam à política do SQL Server (maiúscula, minúscula, dígito e no mínimo 8 caracteres).
 
+### Secret opcional para administração
+
+| Secret | Uso |
+|---|---|
+| `RDS_ADMIN_CIDR` | CIDR IPv4 autorizado a acessar a porta 1433 do SQL Server para administração via SSMS. Use preferencialmente um `/32`, por exemplo `203.0.113.10/32`. Vazio mantém o acesso administrativo fechado. |
+
+Para descobrir o seu IP público atual, montar o CIDR `/32` e configurar a secret no repositório com GitHub CLI:
+
+```powershell
+$publicIp = (Invoke-RestMethod -Uri "https://checkip.amazonaws.com").Trim()
+$rdsAdminCidr = "$publicIp/32"
+
+gh secret set RDS_ADMIN_CIDR --body $rdsAdminCidr
+```
+
+Para confirmar que a secret foi cadastrada:
+
+```powershell
+gh secret list | Select-String '^RDS_ADMIN_CIDR\s'
+```
+
+
 ### Variables
 
 | Variable | Obrigatória | Uso |
@@ -158,7 +180,7 @@ O deploy verifica a presença das 7 senhas antes de iniciar e falha listando as 
 
 Não é necessário criar nada na AWS manualmente. O bucket de estado é criado e reconciliado pelo próprio workflow, e **todos os parâmetros de infraestrutura têm valor padrão no Terraform**.
 
-> **Atenção:** CIDR da VPC, engine, classe de instância, tipo e tamanho de armazenamento do RDS são **fixos no código Terraform**. Não existem variables do GitHub para alterá-los — mudar esses valores exige editar `terraform/infra-db/variables.tf` e abrir um pull request. A única variável Terraform sem valor padrão é a região, preenchida a partir de `AWS_REGION`.
+> **Atenção:** CIDR da VPC, engine, classe de instância, tipo e tamanho de armazenamento do RDS são **fixos no código Terraform**. Não existem variables do GitHub para alterá-los — mudar esses valores exige editar `terraform/infra-db/variables.tf` e abrir um pull request. A única variável Terraform sem valor padrão é a região, preenchida a partir de `AWS_REGION`. A secret opcional `RDS_ADMIN_CIDR` não muda o CIDR da VPC; ela apenas adiciona uma exceção de entrada no security group do RDS.
 
 ---
 
