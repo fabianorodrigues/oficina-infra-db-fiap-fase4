@@ -6,7 +6,7 @@ on:
       - main
     paths:
       - config/**
-      - deploy/bootstrap/**
+      - Dockerfile.bootstrap
       - scripts/**
       - terraform/**
       - .github/workflows/database-infrastructure-*.yml
@@ -59,9 +59,6 @@ jobs:
           check: CKV_AWS_16,CKV_AWS_17,CKV_AWS_23,CKV_AWS_24
           quiet: true
 
-      - name: Setup kubectl
-        uses: azure/setup-kubectl@v4
-
       - name: Validate PowerShell syntax
         shell: pwsh
         run: |
@@ -86,6 +83,14 @@ jobs:
           $ErrorActionPreference = 'Stop'
           ./scripts/validate-database-secrets-config.ps1 -ConfigPath config/database-secrets.json
           ./scripts/validate-database-bootstrap-config.ps1 -ConfigPath config/database-bootstrap.json -SecretsConfigPath config/database-secrets.json
+
+      - name: Validate bootstrap Dockerfile
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dockerfile = Get-Content -LiteralPath Dockerfile.bootstrap -Raw
+          if ($dockerfile -match ':latest\b') { throw 'Dockerfile.bootstrap must not pin a latest image.' }
+          if ($dockerfile -notmatch 'ARG SQL_TOOLS_IMAGE') { throw 'Dockerfile.bootstrap must accept SQL_TOOLS_IMAGE.' }
 
       - name: Backend dry run
         shell: pwsh
@@ -128,47 +133,6 @@ jobs:
           if ($output -notmatch '0 chamadas AWS executadas\.') { throw 'Dry run called AWS.' }
           if ($output -match [regex]::Escape($suffix)) { throw 'Dry run leaked a synthetic value.' }
 
-      - name: Render bootstrap manifests
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $out = Join-Path $env:RUNNER_TEMP 'database-bootstrap'
-          ./scripts/render-database-bootstrap-manifests.ps1 `
-            -ConfigPath config/database-bootstrap.json `
-            -TemplateDirectory deploy/bootstrap `
-            -OutputDirectory $out `
-            -JobName 'oficina-db-bootstrap-ci-0001' `
-            -MasterSecretArn 'arn:aws:secretsmanager:us-east-1:000000000000:secret:synthetic-master-AbCdEf' `
-            -Region 'us-east-1' `
-            -SqlToolsImage 'mcr.microsoft.com/mssql-tools18:synthetic-ci-0001' `
-            -WorkloadIdentityMode 'pod-identity' `
-            -RdsHost 'synthetic-rds.internal.invalid' `
-            -RdsPort '1433'
-          "RENDER_OUTPUT=$out" | Add-Content -Path $env:GITHUB_ENV
-
-      - name: Generate scripts ConfigMap
-        shell: bash
-        run: |
-          set -euo pipefail
-          kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/bootstrap > "$RENDER_OUTPUT/configmap.yaml"
-          if grep -Eiq 'secret_?string|-----BEGIN|AKIA[0-9A-Z]{16}' "$RENDER_OUTPUT/configmap.yaml"; then
-            echo "ConfigMap contains sensitive content." >&2
-            exit 1
-          fi
-
-      - name: Kubeconform
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="v0.6.7"
-          curl -sSL "https://github.com/yannh/kubeconform/releases/download/${version}/kubeconform-linux-amd64.tar.gz" \
-            | tar -xz -C /usr/local/bin kubeconform
-          kubeconform -strict -ignore-missing-schemas -summary \
-            "$RENDER_OUTPUT/service-account.yaml" \
-            "$RENDER_OUTPUT/secret-provider-class.yaml" \
-            "$RENDER_OUTPUT/job.yaml" \
-            "$RENDER_OUTPUT/configmap.yaml"
-
       - name: Actionlint
         shell: bash
         run: |
@@ -185,7 +149,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $files = Get-ChildItem -Path config,deploy,scripts,terraform,.github/workflows -Recurse -File -Force |
+          $files = Get-ChildItem -Path config,scripts,terraform,.github/workflows -Recurse -File -Force |
             Where-Object {
               $_.FullName -notmatch '[\\/]\.terraform[\\/]' -and
               $_.FullName -notmatch '[\\/]\.github[\\/]workflows[\\/]database-infrastructure-ci\.yml$'
@@ -225,6 +189,6 @@ jobs:
           - PowerShell AST and ShellCheck
           - Database contracts
           - Backend and SQL secrets dry runs
-          - Bootstrap manifest rendering and kubeconform
+          - Bootstrap Dockerfile contract
           - Actionlint and static safety checks
           "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY

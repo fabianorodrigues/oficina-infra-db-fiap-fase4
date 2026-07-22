@@ -1,17 +1,20 @@
 {
   "version": 1,
-  "namespace": "oficina",
-  "serviceAccountName": "db-bootstrap",
-  "jobNamePrefix": "oficina-db-bootstrap",
-  "configMapName": "oficina-db-bootstrap-scripts",
-  "secretProviderClassName": "oficina-db-bootstrap",
+  "taskFamily": "oficina-db-bootstrap",
+  "containerName": "db-bootstrap",
   "rds": {
     "endpointParameter": "/oficina/infra/rds/endpoint",
     "portParameter": "/oficina/infra/rds/port",
     "masterSecretArnParameter": "/oficina/infra/rds/master-secret-arn"
   },
-  "cluster": {
-    "nameParameter": "/oficina/infra/cluster/name"
+  "ecs": {
+    "clusterNameParameter": "/oficina/infra/cluster/name",
+    "privateSubnet1Parameter": "/oficina/infra/subnets/private/1",
+    "privateSubnet2Parameter": "/oficina/infra/subnets/private/2",
+    "taskSecurityGroupParameter": "/oficina/infra/ecs/task-security-group-id",
+    "imageRepositoryParameter": "/oficina/infra/ecr/db-bootstrap",
+    "cpu": "512",
+    "memory": "1024"
   },
   "secrets": {
     "cadastroRuntime": "/oficina/cadastro/runtime-db",
@@ -44,9 +47,8 @@
       "readOnlyLogins": []
     }
   ],
-  "job": {
-    "backoffLimit": 0,
-    "activeDeadlineSeconds": 900,
-    "ttlSecondsAfterFinished": 1800
+  "runTask": {
+    "startedBy": "database-bootstrap",
+    "timeoutSeconds": 900
   }
 }

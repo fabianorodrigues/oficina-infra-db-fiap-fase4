@@ -5,9 +5,9 @@
 .DESCRIPTION
     Verifica a estrutura, a unicidade, os limites e a ausencia de dados
     sensiveis em config/database-bootstrap.json, e valida a consistencia com o
-    contrato de sincronizacao config/database-secrets.json e, quando presente,
-    com o template da SecretProviderClass. Nao acessa a AWS e nao le nenhum
-    valor de senha. Retorna exit code diferente de zero em qualquer erro.
+    contrato de sincronizacao config/database-secrets.json e com os metadados
+    necessarios para ECS Run Task. Nao acessa a AWS e nao le nenhum valor de
+    senha. Retorna exit code diferente de zero em qualquer erro.
 
 .PARAMETER ConfigPath
     Caminho do contrato de bootstrap. Padrao: config/database-bootstrap.json.
@@ -15,8 +15,8 @@
 .PARAMETER SecretsConfigPath
     Caminho do contrato de secrets. Padrao: config/database-secrets.json.
 
-.PARAMETER SecretProviderClassTemplate
-    Template opcional da SecretProviderClass para conferencia dos aliases.
+.PARAMETER DockerfilePath
+    Dockerfile usado para publicar a imagem do bootstrap.
 #>
 
 [CmdletBinding()]
@@ -28,22 +28,22 @@ param(
     [string]$SecretsConfigPath = "config/database-secrets.json",
 
     [Parameter(Mandatory = $false)]
-    [string]$SecretProviderClassTemplate = "deploy/bootstrap/secret-provider-class.template.yaml"
+    [string]$DockerfilePath = "Dockerfile.bootstrap"
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 # Contrato canonico dos sete destinos, herdado das Etapas 5 a 7. Sem valores sensiveis.
-# (login, chave em secrets{}, path do secret, banco, papel, alias CSI)
+# (login, chave em secrets{}, path do secret, banco, papel)
 $expected = @(
-    [pscustomobject]@{ Login = 'cadastro_app';       SecretKey = 'cadastroRuntime';   Secret = '/oficina/cadastro/runtime-db';   Database = 'OficinaCadastroDb';        Role = 'runtime';  Alias = 'cadastro-app-password' }
-    [pscustomobject]@{ Login = 'cadastro_migrator';  SecretKey = 'cadastroMigration'; Secret = '/oficina/cadastro/migration-db'; Database = 'OficinaCadastroDb';        Role = 'migrator'; Alias = 'cadastro-migrator-password' }
-    [pscustomobject]@{ Login = 'estoque_app';        SecretKey = 'estoqueRuntime';    Secret = '/oficina/estoque/runtime-db';    Database = 'OficinaEstoqueDb';         Role = 'runtime';  Alias = 'estoque-app-password' }
-    [pscustomobject]@{ Login = 'estoque_migrator';   SecretKey = 'estoqueMigration';  Secret = '/oficina/estoque/migration-db';  Database = 'OficinaEstoqueDb';         Role = 'migrator'; Alias = 'estoque-migrator-password' }
-    [pscustomobject]@{ Login = 'ordens_app';         SecretKey = 'ordensRuntime';     Secret = '/oficina/ordens/runtime-db';     Database = 'OficinaOrdensServicoDb';   Role = 'runtime';  Alias = 'ordens-app-password' }
-    [pscustomobject]@{ Login = 'ordens_migrator';    SecretKey = 'ordensMigration';   Secret = '/oficina/ordens/migration-db';   Database = 'OficinaOrdensServicoDb';   Role = 'migrator'; Alias = 'ordens-migrator-password' }
-    [pscustomobject]@{ Login = 'auth_read';          SecretKey = 'authDatabase';      Secret = '/oficina/auth/database';         Database = 'OficinaCadastroDb';        Role = 'readonly'; Alias = 'auth-read-password' }
+    [pscustomobject]@{ Login = 'cadastro_app';       SecretKey = 'cadastroRuntime';   Secret = '/oficina/cadastro/runtime-db';   Database = 'OficinaCadastroDb';        Role = 'runtime' }
+    [pscustomobject]@{ Login = 'cadastro_migrator';  SecretKey = 'cadastroMigration'; Secret = '/oficina/cadastro/migration-db'; Database = 'OficinaCadastroDb';        Role = 'migrator' }
+    [pscustomobject]@{ Login = 'estoque_app';        SecretKey = 'estoqueRuntime';    Secret = '/oficina/estoque/runtime-db';    Database = 'OficinaEstoqueDb';         Role = 'runtime' }
+    [pscustomobject]@{ Login = 'estoque_migrator';   SecretKey = 'estoqueMigration';  Secret = '/oficina/estoque/migration-db';  Database = 'OficinaEstoqueDb';         Role = 'migrator' }
+    [pscustomobject]@{ Login = 'ordens_app';         SecretKey = 'ordensRuntime';     Secret = '/oficina/ordens/runtime-db';     Database = 'OficinaOrdensServicoDb';   Role = 'runtime' }
+    [pscustomobject]@{ Login = 'ordens_migrator';    SecretKey = 'ordensMigration';   Secret = '/oficina/ordens/migration-db';   Database = 'OficinaOrdensServicoDb';   Role = 'migrator' }
+    [pscustomobject]@{ Login = 'auth_read';          SecretKey = 'authDatabase';      Secret = '/oficina/auth/database';         Database = 'OficinaCadastroDb';        Role = 'readonly' }
 )
 
 $checks = [System.Collections.Generic.List[object]]::new()
@@ -95,33 +95,42 @@ if (-not $jsonValid) {
     exit 1
 }
 
-# 2. Namespace e ServiceAccount.
-$namespace = [string](Get-PropertyValue -Object $config -Name 'namespace')
-$serviceAccount = [string](Get-PropertyValue -Object $config -Name 'serviceAccountName')
-Add-Result "Namespace oficina" $namespace ($namespace -eq 'oficina')
-Add-Result "ServiceAccount db-bootstrap" $serviceAccount ($serviceAccount -eq 'db-bootstrap')
+# 2. Identidade da task.
+$taskFamily = [string](Get-PropertyValue -Object $config -Name 'taskFamily')
+$containerName = [string](Get-PropertyValue -Object $config -Name 'containerName')
+$taskFamilyValid = ($taskFamily -eq 'oficina-db-bootstrap')
+$containerNameValid = ($containerName -eq 'db-bootstrap')
+Add-Result "Task family" $taskFamily $taskFamilyValid
+Add-Result "Container name" $containerName $containerNameValid
 
-# 3. Prefixo do Job valido (rotulo RFC1123, com folga para o sufixo unico).
-$jobPrefix = [string](Get-PropertyValue -Object $config -Name 'jobNamePrefix')
-$jobPrefixValid = ($jobPrefix -match '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$') -and ($jobPrefix.Length -le 40)
-Add-Result "Job prefix valido" $jobPrefix $jobPrefixValid
-
-# 4. Parametros RDS/cluster em /oficina/.
+# 3. Parametros RDS/ECS em /oficina/.
 $rds = Get-PropertyValue -Object $config -Name 'rds'
-$rdsParams = @(
+$ecs = Get-PropertyValue -Object $config -Name 'ecs'
+$ssmParams = @(
     [string](Get-PropertyValue -Object $rds -Name 'endpointParameter'),
     [string](Get-PropertyValue -Object $rds -Name 'portParameter'),
-    [string](Get-PropertyValue -Object $rds -Name 'masterSecretArnParameter')
+    [string](Get-PropertyValue -Object $rds -Name 'masterSecretArnParameter'),
+    [string](Get-PropertyValue -Object $ecs -Name 'clusterNameParameter'),
+    [string](Get-PropertyValue -Object $ecs -Name 'privateSubnet1Parameter'),
+    [string](Get-PropertyValue -Object $ecs -Name 'privateSubnet2Parameter'),
+    [string](Get-PropertyValue -Object $ecs -Name 'taskSecurityGroupParameter'),
+    [string](Get-PropertyValue -Object $ecs -Name 'imageRepositoryParameter')
 )
-$cluster = Get-PropertyValue -Object $config -Name 'cluster'
-if ($null -ne $cluster) { $rdsParams += [string](Get-PropertyValue -Object $cluster -Name 'nameParameter') }
-$allParamsScoped = (@($rdsParams | Where-Object { -not $_.StartsWith('/oficina/') }).Count -eq 0)
+$allParamsScoped = (@($ssmParams | Where-Object { [string]::IsNullOrWhiteSpace($_) -or -not $_.StartsWith('/oficina/') }).Count -eq 0)
 Add-Result "Parametros SSM em /oficina/" $(if ($allParamsScoped) { 'Sim' } else { 'Nao' }) $allParamsScoped
 
 # Confere os paths RDS reais da Infra DB (Etapa 5).
-Add-Result "endpointParameter" $rdsParams[0] ($rdsParams[0] -eq '/oficina/infra/rds/endpoint')
-Add-Result "portParameter" $rdsParams[1] ($rdsParams[1] -eq '/oficina/infra/rds/port')
-Add-Result "masterSecretArnParameter" $rdsParams[2] ($rdsParams[2] -eq '/oficina/infra/rds/master-secret-arn')
+Add-Result "endpointParameter" $ssmParams[0] ($ssmParams[0] -eq '/oficina/infra/rds/endpoint')
+Add-Result "portParameter" $ssmParams[1] ($ssmParams[1] -eq '/oficina/infra/rds/port')
+Add-Result "masterSecretArnParameter" $ssmParams[2] ($ssmParams[2] -eq '/oficina/infra/rds/master-secret-arn')
+Add-Result "clusterNameParameter" $ssmParams[3] ($ssmParams[3] -eq '/oficina/infra/cluster/name')
+Add-Result "taskSecurityGroupParameter" $ssmParams[6] ($ssmParams[6] -eq '/oficina/infra/ecs/task-security-group-id')
+Add-Result "imageRepositoryParameter" $ssmParams[7] ($ssmParams[7] -eq '/oficina/infra/ecr/db-bootstrap')
+
+$cpu = [string](Get-PropertyValue -Object $ecs -Name 'cpu')
+$memory = [string](Get-PropertyValue -Object $ecs -Name 'memory')
+Add-Result "CPU Fargate valida" $cpu (@('256', '512', '1024', '2048', '4096') -contains $cpu)
+Add-Result "Memoria Fargate valida" $memory (-not [string]::IsNullOrWhiteSpace($memory))
 
 # 5. Secrets: sete paths, unicos, escopados.
 $secrets = Get-PropertyValue -Object $config -Name 'secrets'
@@ -174,14 +183,12 @@ foreach ($e in $expected) {
     Add-Result "Login $($e.Login) ($($e.Role)) em $($e.Database)" $(if ($ok) { 'OK' } else { 'Divergente' }) $ok
 }
 
-# 7. Limites do Job.
-$job = Get-PropertyValue -Object $config -Name 'job'
-$backoff = [int](Get-PropertyValue -Object $job -Name 'backoffLimit')
-$deadline = [int](Get-PropertyValue -Object $job -Name 'activeDeadlineSeconds')
-$ttl = [int](Get-PropertyValue -Object $job -Name 'ttlSecondsAfterFinished')
-Add-Result "backoffLimit == 0" "$backoff" ($backoff -eq 0)
-Add-Result "activeDeadlineSeconds > 0" "$deadline" ($deadline -gt 0)
-Add-Result "ttlSecondsAfterFinished > 0" "$ttl" ($ttl -gt 0)
+# 7. Limites de execucao do Run Task.
+$runTask = Get-PropertyValue -Object $config -Name 'runTask'
+$startedBy = [string](Get-PropertyValue -Object $runTask -Name 'startedBy')
+$timeout = [int](Get-PropertyValue -Object $runTask -Name 'timeoutSeconds')
+Add-Result "startedBy database-bootstrap" $startedBy ($startedBy -eq 'database-bootstrap')
+Add-Result "timeoutSeconds > 0" "$timeout" ($timeout -gt 0)
 
 # 8. Ausencia de dados sensiveis e de referencias proibidas no arquivo.
 # Padroes concatenados para nao dispararem sobre si mesmos.
@@ -254,23 +261,13 @@ if ($secretsFileExists) {
     $syncRds = Get-PropertyValue -Object $secretsConfig -Name 'rds'
     $syncEndpoint = [string](Get-PropertyValue -Object $syncRds -Name 'endpointParameter')
     $syncPort = [string](Get-PropertyValue -Object $syncRds -Name 'portParameter')
-    Add-Result "Endpoint param coerente" $syncEndpoint ($syncEndpoint -eq $rdsParams[0])
-    Add-Result "Port param coerente" $syncPort ($syncPort -eq $rdsParams[1])
+    Add-Result "Endpoint param coerente" $syncEndpoint ($syncEndpoint -eq $ssmParams[0])
+    Add-Result "Port param coerente" $syncPort ($syncPort -eq $ssmParams[1])
 }
 
-# 10. Consistencia com o template da SecretProviderClass (aliases e nomes).
-if (Test-Path -LiteralPath $SecretProviderClassTemplate -PathType Leaf) {
-    $spc = Get-Content -LiteralPath $SecretProviderClassTemplate -Raw
-    $spcOk = $true
-    foreach ($e in $expected) {
-        if (($spc -notmatch [regex]::Escape($e.Secret)) -or ($spc -notmatch [regex]::Escape($e.Alias))) {
-            $spcOk = $false
-        }
-    }
-    # Aliases do master secret.
-    if (($spc -notmatch 'master-username') -or ($spc -notmatch 'master-password')) { $spcOk = $false }
-    Add-Result "SecretProviderClass coerente" $(if ($spcOk) { 'Sim' } else { 'Divergente' }) $spcOk
-}
+# 10. Imagem do bootstrap.
+$dockerfileExists = Test-Path -LiteralPath $DockerfilePath -PathType Leaf
+Add-Result "Dockerfile bootstrap existe" $DockerfilePath $dockerfileExists
 
 $checks | Format-Table -AutoSize
 

@@ -17,12 +17,14 @@ concurrency:
 
 jobs:
   bootstrap:
-    name: Bootstrap SQL databases via Kubernetes Job
+    name: Bootstrap SQL databases via ECS Run Task
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
       SQL_TOOLS_IMAGE: ${{ vars.SQL_TOOLS_IMAGE }}
+      ECS_TASK_EXECUTION_ROLE_ARN: ${{ vars.ECS_TASK_EXECUTION_ROLE_ARN }}
+      ECS_TASK_ROLE_ARN: ${{ vars.ECS_TASK_ROLE_ARN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,8 +39,11 @@ jobs:
           if ('${{ inputs.confirmation }}' -cne 'BOOTSTRAP') {
             throw 'Confirmation must be BOOTSTRAP.'
           }
-          if ([string]::IsNullOrWhiteSpace($env:AWS_REGION)) { throw 'Repository Variable AWS_REGION is required.' }
-          if ([string]::IsNullOrWhiteSpace($env:SQL_TOOLS_IMAGE)) { throw 'Repository Variable SQL_TOOLS_IMAGE is required.' }
+          foreach ($name in @('AWS_REGION', 'SQL_TOOLS_IMAGE', 'ECS_TASK_EXECUTION_ROLE_ARN', 'ECS_TASK_ROLE_ARN')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Repository Variable $name is required."
+            }
+          }
           if ($env:SQL_TOOLS_IMAGE -notmatch ':' -or $env:SQL_TOOLS_IMAGE -match ':latest$') {
             throw 'SQL_TOOLS_IMAGE must use an explicit tag or digest and never latest.'
           }
@@ -72,165 +77,142 @@ jobs:
             }
             return $v.Trim()
           }
-          $clusterName   = Get-Ssm '/oficina/infra/cluster/name'
-          $namespace     = Get-Ssm '/oficina/infra/cluster/namespace'
-          $rdsHost       = Get-Ssm '/oficina/infra/rds/endpoint'
-          $rdsPort       = Get-Ssm '/oficina/infra/rds/port'
-          $masterArn     = Get-Ssm '/oficina/infra/rds/master-secret-arn'
+          function Get-SecretArn([string]$id) {
+            $v = aws secretsmanager describe-secret --secret-id $id --region $env:AWS_REGION --query 'ARN' --output text
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($v) -or $v -eq 'None') {
+              throw "Secret not found: $id"
+            }
+            return $v.Trim()
+          }
+
+          $config = Get-Content -LiteralPath 'config/database-bootstrap.json' -Raw | ConvertFrom-Json
+          $clusterName = Get-Ssm $config.ecs.clusterNameParameter
+          $subnet1 = Get-Ssm $config.ecs.privateSubnet1Parameter
+          $subnet2 = Get-Ssm $config.ecs.privateSubnet2Parameter
+          $securityGroup = Get-Ssm $config.ecs.taskSecurityGroupParameter
+          $repository = Get-Ssm $config.ecs.imageRepositoryParameter
+          $rdsHost = Get-Ssm $config.rds.endpointParameter
+          $rdsPort = Get-Ssm $config.rds.portParameter
+          $masterArn = Get-Ssm $config.rds.masterSecretArnParameter
 
           if ($rdsPort -notmatch '^\d+$') { throw "Invalid RDS port in SSM: $rdsPort" }
-          if ($namespace -ne 'oficina') { throw "Unexpected namespace from SSM: $namespace" }
+          aws ecs describe-clusters --clusters $clusterName --region $env:AWS_REGION --query 'clusters[0].status' --output text | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "ECS cluster not found: $clusterName" }
 
-          aws secretsmanager describe-secret --secret-id $masterArn --region $env:AWS_REGION --output json | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw 'Master secret not found in Secrets Manager.' }
+          "CLUSTER_NAME=$clusterName" | Add-Content -Path $env:GITHUB_ENV
+          "PRIVATE_SUBNET_1=$subnet1" | Add-Content -Path $env:GITHUB_ENV
+          "PRIVATE_SUBNET_2=$subnet2" | Add-Content -Path $env:GITHUB_ENV
+          "TASK_SECURITY_GROUP_ID=$securityGroup" | Add-Content -Path $env:GITHUB_ENV
+          "BOOTSTRAP_REPOSITORY=$repository" | Add-Content -Path $env:GITHUB_ENV
+          "BOOTSTRAP_IMAGE=$repository:$env:GITHUB_SHA" | Add-Content -Path $env:GITHUB_ENV
+          "RDS_HOST=$rdsHost" | Add-Content -Path $env:GITHUB_ENV
+          "RDS_PORT=$rdsPort" | Add-Content -Path $env:GITHUB_ENV
+          "MASTER_SECRET_ARN=$masterArn" | Add-Content -Path $env:GITHUB_ENV
 
-          "CLUSTER_NAME=$clusterName"      | Add-Content -Path $env:GITHUB_ENV
-          "NAMESPACE=$namespace"           | Add-Content -Path $env:GITHUB_ENV
-          "RDS_HOST=$rdsHost"              | Add-Content -Path $env:GITHUB_ENV
-          "RDS_PORT=$rdsPort"              | Add-Content -Path $env:GITHUB_ENV
-          "MASTER_SECRET_ARN=$masterArn"   | Add-Content -Path $env:GITHUB_ENV
-          Write-Host "Cluster: $clusterName | Namespace: $namespace | RDS: ${rdsHost}:$rdsPort | master secret: OK"
+          $secretMap = @{
+            CADASTRO_APP_PASSWORD = $config.secrets.cadastroRuntime
+            CADASTRO_MIGRATOR_PASSWORD = $config.secrets.cadastroMigration
+            ESTOQUE_APP_PASSWORD = $config.secrets.estoqueRuntime
+            ESTOQUE_MIGRATOR_PASSWORD = $config.secrets.estoqueMigration
+            ORDENS_APP_PASSWORD = $config.secrets.ordensRuntime
+            ORDENS_MIGRATOR_PASSWORD = $config.secrets.ordensMigration
+            AUTH_READ_PASSWORD = $config.secrets.authDatabase
+          }
+          foreach ($pair in $secretMap.GetEnumerator()) {
+            $arn = Get-SecretArn $pair.Value
+            "$($pair.Key)_SECRET_ARN=$arn" | Add-Content -Path $env:GITHUB_ENV
+          }
+          Write-Host "Resolved ECS, RDS, ECR and secret metadata."
 
       - name: Validate SQL secrets
         shell: pwsh
         run: ./scripts/validate-database-secret-containers.ps1 -ConfigPath config/database-secrets.json -Region $env:AWS_REGION -RequireCurrentVersion $true
 
-      - name: Update kubeconfig
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push bootstrap image
         shell: bash
         run: |
           set -euo pipefail
-          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+          docker build --build-arg SQL_TOOLS_IMAGE="$SQL_TOOLS_IMAGE" -f Dockerfile.bootstrap -t "$BOOTSTRAP_IMAGE" .
+          docker push "$BOOTSTRAP_IMAGE"
 
-      - name: Validate cluster
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Namespace $NAMESPACE"
-          kubectl get namespace "$NAMESPACE" >/dev/null
-
-          echo "Nodes Ready"
-          ready=$(kubectl get nodes -o jsonpath='{range .items[*]}{range .status.conditions[?(@.type=="Ready")]}{.status}{"\n"}{end}{end}' | grep -c '^True' || true)
-          if [ "${ready:-0}" -lt 1 ]; then echo "No Ready node found." >&2; exit 1; fi
-          echo "Nodes Ready: $ready"
-
-          echo "Secrets Store CSI Driver"
-          kubectl get csidriver secrets-store.csi.k8s.io >/dev/null
-
-          echo "AWS Secrets and Configuration Provider"
-          if ! kubectl get daemonset -n kube-system -l app=secrets-store-csi-driver-provider-aws 2>/dev/null | grep -q .; then
-            if ! kubectl get pods -n kube-system -l app.kubernetes.io/name=secrets-store-csi-driver-provider-aws 2>/dev/null | grep -q .; then
-              echo "ASCP was not found in kube-system." >&2
-              exit 1
-            fi
-          fi
-
-          echo "db-bootstrap identity"
-          kubectl get serviceaccount db-bootstrap -n "$NAMESPACE" >/dev/null
-
-          echo "Planned RDS network access"
-          rds_sg=$(aws ssm get-parameter --name /oficina/infra/rds/security-group-id --region "$AWS_REGION" --query 'Parameter.Value' --output text)
-          echo "RDS Security Group: $rds_sg"
-
-      - name: Generate scripts ConfigMap
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p rendered
-          kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/bootstrap > rendered/configmap.yaml
-          if grep -Eiq 'secret_?string|-----BEGIN|AKIA[0-9A-Z]{16}' rendered/configmap.yaml; then
-            echo "ConfigMap contains sensitive content." >&2
-            exit 1
-          fi
-
-      - name: Render manifests
+      - name: Register task definition
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $jobName = "oficina-db-bootstrap-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)"
-          "JOB_NAME=$jobName" | Add-Content -Path $env:GITHUB_ENV
-          ./scripts/render-database-bootstrap-manifests.ps1 `
-            -ConfigPath config/database-bootstrap.json `
-            -TemplateDirectory deploy/bootstrap `
-            -OutputDirectory rendered `
-            -JobName $jobName `
-            -MasterSecretArn $env:MASTER_SECRET_ARN `
-            -Region $env:AWS_REGION `
-            -SqlToolsImage $env:SQL_TOOLS_IMAGE `
-            -WorkloadIdentityMode 'pod-identity' `
-            -RdsHost $env:RDS_HOST `
-            -RdsPort $env:RDS_PORT
+          $container = @{
+            name = 'db-bootstrap'
+            image = $env:BOOTSTRAP_IMAGE
+            essential = $true
+            environment = @(
+              @{ name = 'AWS_REGION'; value = $env:AWS_REGION },
+              @{ name = 'RDS_HOST'; value = $env:RDS_HOST },
+              @{ name = 'RDS_PORT'; value = $env:RDS_PORT }
+            )
+            secrets = @(
+              @{ name = 'MASTER_USERNAME'; valueFrom = "$($env:MASTER_SECRET_ARN):username::" },
+              @{ name = 'MASTER_PASSWORD'; valueFrom = "$($env:MASTER_SECRET_ARN):password::" },
+              @{ name = 'CADASTRO_APP_PASSWORD'; valueFrom = "$($env:CADASTRO_APP_PASSWORD_SECRET_ARN):Password::" },
+              @{ name = 'CADASTRO_MIGRATOR_PASSWORD'; valueFrom = "$($env:CADASTRO_MIGRATOR_PASSWORD_SECRET_ARN):Password::" },
+              @{ name = 'ESTOQUE_APP_PASSWORD'; valueFrom = "$($env:ESTOQUE_APP_PASSWORD_SECRET_ARN):Password::" },
+              @{ name = 'ESTOQUE_MIGRATOR_PASSWORD'; valueFrom = "$($env:ESTOQUE_MIGRATOR_PASSWORD_SECRET_ARN):Password::" },
+              @{ name = 'ORDENS_APP_PASSWORD'; valueFrom = "$($env:ORDENS_APP_PASSWORD_SECRET_ARN):Password::" },
+              @{ name = 'ORDENS_MIGRATOR_PASSWORD'; valueFrom = "$($env:ORDENS_MIGRATOR_PASSWORD_SECRET_ARN):Password::" },
+              @{ name = 'AUTH_READ_PASSWORD'; valueFrom = "$($env:AUTH_READ_PASSWORD_SECRET_ARN):Password::" }
+            )
+            logConfiguration = @{
+              logDriver = 'awslogs'
+              options = @{
+                'awslogs-group' = '/ecs/oficina/db-bootstrap'
+                'awslogs-region' = $env:AWS_REGION
+                'awslogs-stream-prefix' = 'bootstrap'
+              }
+            }
+          }
+          $taskDefinition = @{
+            family = 'oficina-db-bootstrap'
+            networkMode = 'awsvpc'
+            requiresCompatibilities = @('FARGATE')
+            cpu = '512'
+            memory = '1024'
+            executionRoleArn = $env:ECS_TASK_EXECUTION_ROLE_ARN
+            taskRoleArn = $env:ECS_TASK_ROLE_ARN
+            containerDefinitions = @($container)
+          }
+          $path = Join-Path $env:RUNNER_TEMP 'db-bootstrap-taskdef.json'
+          $taskDefinition | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $path -Encoding utf8
+          $arn = aws ecs register-task-definition --cli-input-json "file://$path" --region $env:AWS_REGION --query 'taskDefinition.taskDefinitionArn' --output text
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($arn)) { throw 'Failed to register bootstrap task definition.' }
+          "TASK_DEFINITION_ARN=$arn" | Add-Content -Path $env:GITHUB_ENV
 
-      - name: Install kubeconform
+      - name: Run bootstrap task
         shell: bash
         run: |
           set -euo pipefail
-          version="v0.6.7"
-          curl -sSL "https://github.com/yannh/kubeconform/releases/download/${version}/kubeconform-linux-amd64.tar.gz" \
-            | tar -xz -C /usr/local/bin kubeconform
-
-      - name: Validate rendered manifests
-        shell: bash
-        run: |
-          set -euo pipefail
-          kubeconform -strict -ignore-missing-schemas -summary \
-            rendered/service-account.yaml \
-            rendered/secret-provider-class.yaml \
-            rendered/job.yaml \
-            rendered/configmap.yaml
-
-      - name: Apply dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          kubectl apply -f rendered/service-account.yaml
-          kubectl apply -f rendered/secret-provider-class.yaml
-          kubectl apply -f rendered/configmap.yaml
-          kubectl apply -f rendered/job.yaml
-
-      - name: Validate job
-        shell: bash
-        run: |
-          set -euo pipefail
-          deadline=$((SECONDS + 1000))
-          result="timeout"
-          while [ $SECONDS -lt $deadline ]; do
-            succeeded=$(kubectl get job "$JOB_NAME" -n "$NAMESPACE" -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "")
-            failed=$(kubectl get job "$JOB_NAME" -n "$NAMESPACE" -o jsonpath='{.status.failed}' 2>/dev/null || echo "")
-            if [ "${succeeded:-0}" = "1" ]; then result="complete"; break; fi
-            if [ -n "${failed:-}" ] && [ "${failed:-0}" != "0" ]; then result="failed"; break; fi
-            sleep 10
-          done
-          echo "JOB_RESULT=$result" >> "$GITHUB_ENV"
-          echo "Job result: $result"
-
-      - name: Capture logs
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          kubectl logs "job/$JOB_NAME" -n "$NAMESPACE" --all-containers=true > rendered/job.log 2>/dev/null || true
-          if grep -Eiq 'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|-----BEGIN|server=tcp:|password=[^ ]' rendered/job.log; then
-            echo "Potential secret leak in logs. Content will not be displayed." >&2
+          task_arn=$(aws ecs run-task \
+            --cluster "$CLUSTER_NAME" \
+            --launch-type FARGATE \
+            --started-by database-bootstrap \
+            --task-definition "$TASK_DEFINITION_ARN" \
+            --network-configuration "awsvpcConfiguration={subnets=[$PRIVATE_SUBNET_1,$PRIVATE_SUBNET_2],securityGroups=[$TASK_SECURITY_GROUP_ID],assignPublicIp=DISABLED}" \
+            --region "$AWS_REGION" \
+            --query 'tasks[0].taskArn' \
+            --output text)
+          if [ -z "$task_arn" ] || [ "$task_arn" = "None" ]; then
+            echo "ECS run-task did not return a task ARN." >&2
             exit 1
           fi
-          echo "----- Sanitized Job logs -----"
-          tail -n 60 rendered/job.log || true
-
-      - name: Check job result
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "${JOB_RESULT:-}" != "complete" ]; then
-            echo "Job did not complete successfully. Result: ${JOB_RESULT:-unknown}." >&2
-            kubectl describe job "$JOB_NAME" -n "$NAMESPACE" || true
+          echo "TASK_ARN=$task_arn" >> "$GITHUB_ENV"
+          aws ecs wait tasks-stopped --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION"
+          exit_code=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query "tasks[0].containers[?name==\`db-bootstrap\`].exitCode | [0]" --output text)
+          stopped_reason=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query 'tasks[0].stoppedReason' --output text)
+          echo "Task stopped: $stopped_reason"
+          if [ "$exit_code" != "0" ]; then
+            echo "Bootstrap task failed with exit code $exit_code." >&2
             exit 1
           fi
-
-      - name: Validate bootstrap
-        shell: pwsh
-        run: |
-          ./scripts/validate-database-bootstrap.ps1 -Namespace $env:NAMESPACE -JobName $env:JOB_NAME -AwsRegion $env:AWS_REGION
 
       - name: Publish summary
         if: always()
@@ -239,29 +221,16 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $config = Get-Content -LiteralPath 'config/database-bootstrap.json' -Raw | ConvertFrom-Json
           $dbs = @($config.databases | ForEach-Object { $_.name })
-          $logins = @()
-          foreach ($d in $config.databases) {
-            $logins += $d.runtimeLogin; $logins += $d.migratorLogin
-            foreach ($r in $d.readOnlyLogins) { $logins += $r }
-          }
-          $secrets = @($config.secrets.PSObject.Properties | ForEach-Object { $_.Value })
           $lines = @()
           $lines += '## Database Bootstrap'
           $lines += ''
           $lines += "Cluster: $env:CLUSTER_NAME"
-          $lines += "Namespace: $env:NAMESPACE"
-          $lines += "Job: $env:JOB_NAME"
-          $lines += "Job result: $($env:JOB_RESULT)"
+          $lines += "Task definition: $env:TASK_DEFINITION_ARN"
+          $lines += "Task: $env:TASK_ARN"
+          $lines += "Image: $env:BOOTSTRAP_IMAGE"
           $lines += ''
           $lines += 'Expected databases:'
           foreach ($d in $dbs) { $lines += "- $d" }
           $lines += ''
-          $lines += 'Expected logins:'
-          foreach ($l in $logins) { $lines += "- $l" }
-          $lines += ''
-          $lines += 'Validated secrets:'
-          foreach ($s in $secrets) { $lines += "- $s" }
-          $lines += ''
-          $lines += 'SQL validation: executed by the Job.'
-          $lines += 'Sensitive values were not printed.'
+          $lines += 'Sensitive values were injected as ECS secrets and were not printed.'
           ($lines -join "`n") | Add-Content -Path $env:GITHUB_STEP_SUMMARY
