@@ -206,7 +206,7 @@ jobs:
           fi
           echo "TASK_ARN=$task_arn" >> "$GITHUB_ENV"
           aws ecs wait tasks-stopped --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION"
-          exit_code=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query 'tasks[0].containers[?name==`db-bootstrap`].exitCode | [0]' --output text)
+          exit_code=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query "tasks[0].containers[?name==\`db-bootstrap\`].exitCode | [0]" --output text)
           stopped_reason=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query 'tasks[0].stoppedReason' --output text)
           echo "Task stopped: $stopped_reason"
           if [ "$exit_code" != "0" ]; then
