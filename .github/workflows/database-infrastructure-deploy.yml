@@ -174,9 +174,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $arguments = @('-Region', $env:AWS_REGION, '-ExpectedVpcCidr', '10.40.0.0/16')
+          $arguments = @{
+            Region = $env:AWS_REGION
+            ExpectedVpcCidr = '10.40.0.0/16'
+          }
           if (-not [string]::IsNullOrWhiteSpace($env:RDS_ADMIN_CIDR)) {
-            $arguments += @('-RdsAdminCidr', $env:RDS_ADMIN_CIDR.Trim())
+            $arguments.RdsAdminCidr = $env:RDS_ADMIN_CIDR.Trim()
           }
           ./scripts/validate-infra-db.ps1 @arguments
 
