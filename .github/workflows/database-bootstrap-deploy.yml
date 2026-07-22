@@ -104,7 +104,7 @@ jobs:
           "PRIVATE_SUBNET_2=$subnet2" | Add-Content -Path $env:GITHUB_ENV
           "TASK_SECURITY_GROUP_ID=$securityGroup" | Add-Content -Path $env:GITHUB_ENV
           "BOOTSTRAP_REPOSITORY=$repository" | Add-Content -Path $env:GITHUB_ENV
-          "BOOTSTRAP_IMAGE=$repository:$env:GITHUB_SHA" | Add-Content -Path $env:GITHUB_ENV
+          "BOOTSTRAP_IMAGE=${repository}:$env:GITHUB_SHA" | Add-Content -Path $env:GITHUB_ENV
           "RDS_HOST=$rdsHost" | Add-Content -Path $env:GITHUB_ENV
           "RDS_PORT=$rdsPort" | Add-Content -Path $env:GITHUB_ENV
           "MASTER_SECRET_ARN=$masterArn" | Add-Content -Path $env:GITHUB_ENV
