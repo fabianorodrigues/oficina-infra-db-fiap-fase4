@@ -54,11 +54,8 @@ terraform.rc
 *.secret-payload.json
 database-secrets.local.json
 
-# Database bootstrap: manifests renderizados, ConfigMap gerado e logs do Job
-# sao artefatos efemeros da pipeline; nunca versionar.
+# Database bootstrap: o SQL renderizado e um artefato efemero da pipeline;
+# nunca versionar.
 rendered/
 *.rendered.sql
-*.rendered.yaml
-job.log
-kubeconfig
 
