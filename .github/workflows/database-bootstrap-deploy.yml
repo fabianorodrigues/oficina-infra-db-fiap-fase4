@@ -109,6 +109,10 @@ jobs:
           "RDS_PORT=$rdsPort" | Add-Content -Path $env:GITHUB_ENV
           "MASTER_SECRET_ARN=$masterArn" | Add-Content -Path $env:GITHUB_ENV
 
+          $runTaskTimeout = [int]($config.runTask.timeoutSeconds)
+          if ($runTaskTimeout -le 0) { $runTaskTimeout = 900 }
+          "RUN_TASK_TIMEOUT_SECONDS=$runTaskTimeout" | Add-Content -Path $env:GITHUB_ENV
+
           $secretMap = @{
             CADASTRO_APP_PASSWORD = $config.secrets.cadastroRuntime
             CADASTRO_MIGRATOR_PASSWORD = $config.secrets.cadastroMigration
@@ -204,8 +208,20 @@ jobs:
             echo "ECS run-task did not return a task ARN." >&2
             exit 1
           fi
-          echo "TASK_ARN=$task_arn" >> "$GITHUB_ENV"
-          aws ecs wait tasks-stopped --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION"
+          echo "TASK_ARN=$task_arn" >> "$GITHUB_ENV"          
+          timeout_seconds="${RUN_TASK_TIMEOUT_SECONDS:-900}"
+          deadline=$(( $(date +%s) + timeout_seconds ))
+          while true; do
+            last_status=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query 'tasks[0].lastStatus' --output text)
+            if [ "$last_status" = "STOPPED" ]; then
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "Bootstrap task did not stop within ${timeout_seconds}s (last status: ${last_status})." >&2
+              exit 1
+            fi
+            sleep 15
+          done
           exit_code=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query "tasks[0].containers[?name==\`db-bootstrap\`].exitCode | [0]" --output text)
           stopped_reason=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query 'tasks[0].stoppedReason' --output text)
           echo "Task stopped: $stopped_reason"
