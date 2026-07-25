@@ -192,8 +192,30 @@ fi
 k3s kubectl apply -f "$WORK/job.yaml" >/dev/null
 echo "Job $JOB aplicado."
 
-result=0
-k3s kubectl -n "$NS" wait --for=condition=complete --timeout="${TIMEOUT}s" "job/$JOB" >/dev/null 2>&1 || result=1
+result=1
+deadline=$(( $(date +%s) + TIMEOUT ))
+while true; do
+    complete_status="$(k3s kubectl -n "$NS" get job "$JOB" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)"
+    failed_status="$(k3s kubectl -n "$NS" get job "$JOB" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+
+    if [ "$complete_status" = "True" ]; then
+        result=0
+        break
+    fi
+
+    if [ "$failed_status" = "True" ]; then
+        failed_reason="$(k3s kubectl -n "$NS" get job "$JOB" -o jsonpath='{.status.conditions[?(@.type=="Failed")].reason}' 2>/dev/null || true)"
+        echo "Job $JOB marcou Failed${failed_reason:+ ($failed_reason)}." >&2
+        break
+    fi
+
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+        echo "Job $JOB nao concluiu dentro de ${TIMEOUT}s." >&2
+        break
+    fi
+
+    sleep 5
+done
 
 echo "----- logs de $JOB -----"
 k3s kubectl -n "$NS" logs "job/$JOB" --tail=-1 2>&1 || true
