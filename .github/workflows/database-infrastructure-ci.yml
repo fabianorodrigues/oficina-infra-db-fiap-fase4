@@ -11,6 +11,7 @@ on:
       - terraform/**
       - .github/workflows/database-infrastructure-*.yml
       - .github/workflows/database-bootstrap-deploy.yml
+      - .github/workflows/initial-admin-provision.yml
       - .tflint.hcl
       - .gitignore
   workflow_dispatch:
@@ -143,7 +144,8 @@ jobs:
           "$RUNNER_TEMP/actionlint/actionlint" \
             "$GITHUB_WORKSPACE/.github/workflows/database-infrastructure-ci.yml" \
             "$GITHUB_WORKSPACE/.github/workflows/database-infrastructure-deploy.yml" \
-            "$GITHUB_WORKSPACE/.github/workflows/database-bootstrap-deploy.yml"
+            "$GITHUB_WORKSPACE/.github/workflows/database-bootstrap-deploy.yml" \
+            "$GITHUB_WORKSPACE/.github/workflows/initial-admin-provision.yml"
 
       - name: Static safety checks
         shell: pwsh

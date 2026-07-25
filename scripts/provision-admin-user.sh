@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Executado dentro de uma ECS Run Task, na mesma imagem do bootstrap. Le a
-# identidade master do RDS dos secrets injetados pelo ECS e os dados do admin
+# Executado dentro de um Job Kubernetes, na mesma imagem do bootstrap. Le a
+# identidade master do RDS dos secrets injetados no cluster e os dados do admin
 # inicial (CPF, nome e hash PBKDF2) de variaveis de ambiente, renderiza o SQL em
-# arquivo temporario restrito e executa o provisionamento idempotente.
+# arquivo temporario restrito e executa o provisionamento idempotente quando as
+# migrations do Cadastro ja criaram dbo.Funcionarios.
 
 # Os marcadores ($(ADMIN_*_SQL)) sao strings literais propositais, substituidas
 # por literais T-SQL antes do sqlcmd. Nao devem expandir no shell.
@@ -69,10 +70,40 @@ escape_tsql() {
     printf '%s' "${raw//\'/\'\'}"
 }
 
-log "Validando identidade master e dados do admin inicial..."
+log "Validando identidade master e pre-condicoes do admin inicial..."
 MASTER_USER="$(read_secret_value MASTER_USERNAME 'master-username')"
 MASTER_PASSWORD="$(read_secret_value MASTER_PASSWORD 'master-password')"
 
+conn_args=(-S "tcp:${RDS_HOST},${RDS_PORT}" -U "$MASTER_USER" -d master -l "$LOGIN_TIMEOUT" -b -x -N)
+if [ "$SQL_ENCRYPT_TRUST_SERVER_CERT" = "true" ]; then
+    conn_args+=(-C)
+    log "Aviso: validacao do certificado do servidor desabilitada (-C). Conexao permanece criptografada."
+fi
+
+export SQLCMDPASSWORD="$MASTER_PASSWORD"
+unset MASTER_PASSWORD
+
+log "Conectando ao RDS em ${RDS_HOST}:${RDS_PORT} como usuario master (senha via SQLCMDPASSWORD)."
+
+precheck_query="SET NOCOUNT ON; IF DB_ID(N'OficinaCadastroDb') IS NULL SELECT N'MISSING_DATABASE'; ELSE IF NOT EXISTS (SELECT 1 FROM [OficinaCadastroDb].sys.tables t JOIN [OficinaCadastroDb].sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = N'dbo' AND t.name = N'Funcionarios') SELECT N'MISSING_FUNCIONARIOS'; ELSE SELECT N'READY';"
+precheck_result="$("$SQLCMD" "${conn_args[@]}" -h -1 -W -Q "$precheck_query" | tr -d '\r' | sed '/^[[:space:]]*$/d' | head -n 1 | tr -d '[:space:]')"
+
+case "$precheck_result" in
+    READY)
+        log "Pre-condicoes conferidas: OficinaCadastroDb.dbo.Funcionarios existe."
+        ;;
+    MISSING_FUNCIONARIOS)
+        fail "dbo.Funcionarios nao existe. Execute o Cadastro Deploy primeiro e depois rode o workflow Initial Admin Provision."
+        ;;
+    MISSING_DATABASE)
+        fail "OficinaCadastroDb nao existe. Rode o bootstrap estrutural dos bancos antes."
+        ;;
+    *)
+        fail "Resultado inesperado ao verificar pre-condicoes do admin inicial: ${precheck_result:-vazio}"
+        ;;
+esac
+
+log "Validando dados do admin inicial..."
 ADMIN_CPF_RAW="$(read_secret_value ADMIN_CPF 'ADMIN_INICIAL_CPF')"
 ADMIN_NOME_RAW="$(read_secret_value ADMIN_NOME 'ADMIN_NOME')"
 ADMIN_SENHA_HASH_RAW="$(read_secret_value ADMIN_SENHA_HASH 'ADMIN_SENHA_HASH')"
@@ -167,17 +198,6 @@ mkdir -p "$WORK_DIR"
 ( umask 077; printf '%s' "$rendered" > "$RENDERED_SQL" )
 chmod 600 "$RENDERED_SQL" 2>/dev/null || true
 unset rendered sql_executavel
-
-conn_args=(-S "tcp:${RDS_HOST},${RDS_PORT}" -U "$MASTER_USER" -d master -l "$LOGIN_TIMEOUT" -b -x -N)
-if [ "$SQL_ENCRYPT_TRUST_SERVER_CERT" = "true" ]; then
-    conn_args+=(-C)
-    log "Aviso: validacao do certificado do servidor desabilitada (-C). Conexao permanece criptografada."
-fi
-
-export SQLCMDPASSWORD="$MASTER_PASSWORD"
-unset MASTER_PASSWORD
-
-log "Conectando ao RDS em ${RDS_HOST}:${RDS_PORT} como usuario master (senha via SQLCMDPASSWORD)."
 
 log "Provisionando o admin inicial em OficinaCadastroDb.dbo.Funcionarios..."
 if ! "$SQLCMD" "${conn_args[@]}" -i "$RENDERED_SQL"; then
