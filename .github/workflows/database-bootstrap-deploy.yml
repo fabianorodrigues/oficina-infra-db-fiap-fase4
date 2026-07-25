@@ -23,16 +23,20 @@ concurrency:
   group: database-bootstrap
   cancel-in-progress: false
 
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  # Limite conservador para o corpo de um Run Command. Acima disso o comando e
+  # truncado em silencio, e truncamento silencioso e o modo de falha que este
+  # limite existe para impedir.
+  MAX_MANIFEST_BYTES: "30000"
+
 jobs:
   bootstrap:
-    name: Bootstrap SQL databases via ECS Run Task
+    name: Bootstrap SQL databases through a Kubernetes Job
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      AWS_REGION: ${{ vars.AWS_REGION }}
       SQL_TOOLS_IMAGE: ${{ vars.SQL_TOOLS_IMAGE }}
-      ECS_TASK_EXECUTION_ROLE_ARN: ${{ vars.ECS_TASK_EXECUTION_ROLE_ARN }}
-      ECS_TASK_ROLE_ARN: ${{ vars.ECS_TASK_ROLE_ARN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -47,7 +51,7 @@ jobs:
           if ('${{ inputs.confirmation }}' -cne 'BOOTSTRAP') {
             throw 'Confirmation must be BOOTSTRAP.'
           }
-          foreach ($name in @('AWS_REGION', 'SQL_TOOLS_IMAGE', 'ECS_TASK_EXECUTION_ROLE_ARN', 'ECS_TASK_ROLE_ARN')) {
+          foreach ($name in @('AWS_REGION', 'SQL_TOOLS_IMAGE')) {
             if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
               throw "Repository Variable $name is required."
             }
@@ -74,7 +78,7 @@ jobs:
         shell: pwsh
         run: aws sts get-caller-identity
 
-      - name: Resolve AWS metadata
+      - name: Resolve cluster and database metadata
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -85,56 +89,32 @@ jobs:
             }
             return $v.Trim()
           }
-          function Get-SecretArn([string]$id) {
-            $v = aws secretsmanager describe-secret --secret-id $id --region $env:AWS_REGION --query 'ARN' --output text
-            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($v) -or $v -eq 'None') {
-              throw "Secret not found: $id"
-            }
-            return $v.Trim()
-          }
 
           $config = Get-Content -LiteralPath 'config/database-bootstrap.json' -Raw | ConvertFrom-Json
-          $clusterName = Get-Ssm $config.ecs.clusterNameParameter
-          $subnet1 = Get-Ssm $config.ecs.privateSubnet1Parameter
-          $subnet2 = Get-Ssm $config.ecs.privateSubnet2Parameter
-          $securityGroup = Get-Ssm $config.ecs.taskSecurityGroupParameter
-          $repository = Get-Ssm $config.ecs.imageRepositoryParameter
+          $namespace = Get-Ssm $config.kubernetes.namespaceParameter
+          $instanceId = Get-Ssm $config.kubernetes.instanceIdParameter
+          $repository = Get-Ssm $config.kubernetes.imageRepositoryParameter
           $rdsHost = Get-Ssm $config.rds.endpointParameter
           $rdsPort = Get-Ssm $config.rds.portParameter
-          $masterArn = Get-Ssm $config.rds.masterSecretArnParameter
+          $masterSecret = Get-Ssm $config.rds.masterSecretArnParameter
 
           if ($rdsPort -notmatch '^\d+$') { throw "Invalid RDS port in SSM: $rdsPort" }
-          aws ecs describe-clusters --clusters $clusterName --region $env:AWS_REGION --query 'clusters[0].status' --output text | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "ECS cluster not found: $clusterName" }
+          if ($instanceId -notmatch '^i-[0-9a-f]+$') { throw 'Invalid Kubernetes node instance id in SSM.' }
 
-          "CLUSTER_NAME=$clusterName" | Add-Content -Path $env:GITHUB_ENV
-          "PRIVATE_SUBNET_1=$subnet1" | Add-Content -Path $env:GITHUB_ENV
-          "PRIVATE_SUBNET_2=$subnet2" | Add-Content -Path $env:GITHUB_ENV
-          "TASK_SECURITY_GROUP_ID=$securityGroup" | Add-Content -Path $env:GITHUB_ENV
-          "BOOTSTRAP_REPOSITORY=$repository" | Add-Content -Path $env:GITHUB_ENV
+          $ping = aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$instanceId" --region $env:AWS_REGION --query 'InstanceInformationList[0].PingStatus' --output text
+          if ($ping -ne 'Online') { throw "Kubernetes node $instanceId is not Online in Systems Manager (status: $ping)." }
+
+          "K8S_NAMESPACE=$namespace" | Add-Content -Path $env:GITHUB_ENV
+          "K8S_INSTANCE_ID=$instanceId" | Add-Content -Path $env:GITHUB_ENV
           "BOOTSTRAP_IMAGE=${repository}:$env:GITHUB_SHA" | Add-Content -Path $env:GITHUB_ENV
           "RDS_HOST=$rdsHost" | Add-Content -Path $env:GITHUB_ENV
           "RDS_PORT=$rdsPort" | Add-Content -Path $env:GITHUB_ENV
-          "MASTER_SECRET_ARN=$masterArn" | Add-Content -Path $env:GITHUB_ENV
+          "MASTER_SECRET_ID=$masterSecret" | Add-Content -Path $env:GITHUB_ENV
 
-          $runTaskTimeout = [int]($config.runTask.timeoutSeconds)
-          if ($runTaskTimeout -le 0) { $runTaskTimeout = 900 }
-          "RUN_TASK_TIMEOUT_SECONDS=$runTaskTimeout" | Add-Content -Path $env:GITHUB_ENV
-
-          $secretMap = @{
-            CADASTRO_APP_PASSWORD = $config.secrets.cadastroRuntime
-            CADASTRO_MIGRATOR_PASSWORD = $config.secrets.cadastroMigration
-            ESTOQUE_APP_PASSWORD = $config.secrets.estoqueRuntime
-            ESTOQUE_MIGRATOR_PASSWORD = $config.secrets.estoqueMigration
-            ORDENS_APP_PASSWORD = $config.secrets.ordensRuntime
-            ORDENS_MIGRATOR_PASSWORD = $config.secrets.ordensMigration
-            AUTH_READ_PASSWORD = $config.secrets.authDatabase
-          }
-          foreach ($pair in $secretMap.GetEnumerator()) {
-            $arn = Get-SecretArn $pair.Value
-            "$($pair.Key)_SECRET_ARN=$arn" | Add-Content -Path $env:GITHUB_ENV
-          }
-          Write-Host "Resolved ECS, RDS, ECR and secret metadata."
+          $timeout = [int]($config.job.timeoutSeconds)
+          if ($timeout -le 0) { $timeout = 900 }
+          "JOB_TIMEOUT_SECONDS=$timeout" | Add-Content -Path $env:GITHUB_ENV
+          Write-Host 'Resolved Kubernetes, RDS and registry metadata.'
 
       - name: Validate SQL secrets
         shell: pwsh
@@ -150,93 +130,15 @@ jobs:
           docker build --build-arg SQL_TOOLS_IMAGE="$SQL_TOOLS_IMAGE" -f Dockerfile.bootstrap -t "$BOOTSTRAP_IMAGE" .
           docker push "$BOOTSTRAP_IMAGE"
 
-      - name: Register task definition
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $container = @{
-            name = 'db-bootstrap'
-            image = $env:BOOTSTRAP_IMAGE
-            essential = $true
-            environment = @(
-              @{ name = 'AWS_REGION'; value = $env:AWS_REGION },
-              @{ name = 'RDS_HOST'; value = $env:RDS_HOST },
-              @{ name = 'RDS_PORT'; value = $env:RDS_PORT }
-            )
-            secrets = @(
-              @{ name = 'MASTER_USERNAME'; valueFrom = "$($env:MASTER_SECRET_ARN):username::" },
-              @{ name = 'MASTER_PASSWORD'; valueFrom = "$($env:MASTER_SECRET_ARN):password::" },
-              @{ name = 'CADASTRO_APP_PASSWORD'; valueFrom = "$($env:CADASTRO_APP_PASSWORD_SECRET_ARN):Password::" },
-              @{ name = 'CADASTRO_MIGRATOR_PASSWORD'; valueFrom = "$($env:CADASTRO_MIGRATOR_PASSWORD_SECRET_ARN):Password::" },
-              @{ name = 'ESTOQUE_APP_PASSWORD'; valueFrom = "$($env:ESTOQUE_APP_PASSWORD_SECRET_ARN):Password::" },
-              @{ name = 'ESTOQUE_MIGRATOR_PASSWORD'; valueFrom = "$($env:ESTOQUE_MIGRATOR_PASSWORD_SECRET_ARN):Password::" },
-              @{ name = 'ORDENS_APP_PASSWORD'; valueFrom = "$($env:ORDENS_APP_PASSWORD_SECRET_ARN):Password::" },
-              @{ name = 'ORDENS_MIGRATOR_PASSWORD'; valueFrom = "$($env:ORDENS_MIGRATOR_PASSWORD_SECRET_ARN):Password::" },
-              @{ name = 'AUTH_READ_PASSWORD'; valueFrom = "$($env:AUTH_READ_PASSWORD_SECRET_ARN):Password::" }
-            )
-            logConfiguration = @{
-              logDriver = 'awslogs'
-              options = @{
-                'awslogs-group' = '/ecs/oficina/db-bootstrap'
-                'awslogs-region' = $env:AWS_REGION
-                'awslogs-stream-prefix' = 'bootstrap'
-              }
-            }
-          }
-          $taskDefinition = @{
-            family = 'oficina-db-bootstrap'
-            networkMode = 'awsvpc'
-            requiresCompatibilities = @('FARGATE')
-            cpu = '512'
-            memory = '1024'
-            executionRoleArn = $env:ECS_TASK_EXECUTION_ROLE_ARN
-            taskRoleArn = $env:ECS_TASK_ROLE_ARN
-            containerDefinitions = @($container)
-          }
-          $path = Join-Path $env:RUNNER_TEMP 'db-bootstrap-taskdef.json'
-          $taskDefinition | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $path -Encoding utf8
-          $arn = aws ecs register-task-definition --cli-input-json "file://$path" --region $env:AWS_REGION --query 'taskDefinition.taskDefinitionArn' --output text
-          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($arn)) { throw 'Failed to register bootstrap task definition.' }
-          "TASK_DEFINITION_ARN=$arn" | Add-Content -Path $env:GITHUB_ENV
-
-      - name: Run bootstrap task
+      - name: Run database bootstrap job
         shell: bash
         run: |
           set -euo pipefail
-          task_arn=$(aws ecs run-task \
-            --cluster "$CLUSTER_NAME" \
-            --launch-type FARGATE \
-            --started-by database-bootstrap \
-            --task-definition "$TASK_DEFINITION_ARN" \
-            --network-configuration "awsvpcConfiguration={subnets=[$PRIVATE_SUBNET_1,$PRIVATE_SUBNET_2],securityGroups=[$TASK_SECURITY_GROUP_ID],assignPublicIp=DISABLED}" \
-            --region "$AWS_REGION" \
-            --query 'tasks[0].taskArn' \
-            --output text)
-          if [ -z "$task_arn" ] || [ "$task_arn" = "None" ]; then
-            echo "ECS run-task did not return a task ARN." >&2
-            exit 1
-          fi
-          echo "TASK_ARN=$task_arn" >> "$GITHUB_ENV"          
-          timeout_seconds="${RUN_TASK_TIMEOUT_SECONDS:-900}"
-          deadline=$(( $(date +%s) + timeout_seconds ))
-          while true; do
-            last_status=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query 'tasks[0].lastStatus' --output text)
-            if [ "$last_status" = "STOPPED" ]; then
-              break
-            fi
-            if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "Bootstrap task did not stop within ${timeout_seconds}s (last status: ${last_status})." >&2
-              exit 1
-            fi
-            sleep 15
-          done
-          exit_code=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query "tasks[0].containers[?name==\`db-bootstrap\`].exitCode | [0]" --output text)
-          stopped_reason=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query 'tasks[0].stoppedReason' --output text)
-          echo "Task stopped: $stopped_reason"
-          if [ "$exit_code" != "0" ]; then
-            echo "Bootstrap task failed with exit code $exit_code." >&2
-            exit 1
-          fi
+          bash .github/scripts/run-database-job.sh \
+            --manifest k8s/db-bootstrap-job.yaml \
+            --job-name "oficina-db-bootstrap-${GITHUB_RUN_ID}" \
+            --secret-name oficina-db-bootstrap-credentials \
+            --secret-source bootstrap
 
       - name: Publish summary
         if: always()
@@ -244,31 +146,75 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $config = Get-Content -LiteralPath 'config/database-bootstrap.json' -Raw | ConvertFrom-Json
-          $dbs = @($config.databases | ForEach-Object { $_.name })
           $lines = @()
           $lines += '## Database Bootstrap'
           $lines += ''
-          $lines += "Cluster: $env:CLUSTER_NAME"
-          $lines += "Task definition: $env:TASK_DEFINITION_ARN"
-          $lines += "Task: $env:TASK_ARN"
+          $lines += "Namespace: $env:K8S_NAMESPACE"
+          $lines += "Job: oficina-db-bootstrap-$env:GITHUB_RUN_ID"
           $lines += "Image: $env:BOOTSTRAP_IMAGE"
           $lines += ''
           $lines += 'Expected databases:'
-          foreach ($d in $dbs) { $lines += "- $d" }
+          foreach ($d in $config.databases) { $lines += "- $($d.name)" }
           $lines += ''
-          $lines += 'Sensitive values were injected as ECS secrets and were not printed.'
+          $lines += 'Secrets were read from Secrets Manager inside the node and materialised as a temporary'
+          $lines += 'Kubernetes Secret removed in a finally block. No secret value passed through the runner,'
+          $lines += 'through S3 or as a Run Command parameter.'
           ($lines -join "`n") | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+  database-isolation:
+    name: Validate database isolation
+    needs: bootstrap
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Resolve cluster and database metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Get-Ssm([string]$name) {
+            $v = aws ssm get-parameter --name $name --region $env:AWS_REGION --query 'Parameter.Value' --output text
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($v) -or $v -eq 'None') { throw "Missing or empty SSM parameter: $name" }
+            return $v.Trim()
+          }
+          $config = Get-Content -LiteralPath 'config/database-bootstrap.json' -Raw | ConvertFrom-Json
+          "K8S_NAMESPACE=$(Get-Ssm $config.kubernetes.namespaceParameter)" | Add-Content -Path $env:GITHUB_ENV
+          "K8S_INSTANCE_ID=$(Get-Ssm $config.kubernetes.instanceIdParameter)" | Add-Content -Path $env:GITHUB_ENV
+          "BOOTSTRAP_IMAGE=$(Get-Ssm $config.kubernetes.imageRepositoryParameter):$env:GITHUB_SHA" | Add-Content -Path $env:GITHUB_ENV
+          "RDS_HOST=$(Get-Ssm $config.rds.endpointParameter)" | Add-Content -Path $env:GITHUB_ENV
+          "RDS_PORT=$(Get-Ssm $config.rds.portParameter)" | Add-Content -Path $env:GITHUB_ENV
+          "MASTER_SECRET_ID=$(Get-Ssm $config.rds.masterSecretArnParameter)" | Add-Content -Path $env:GITHUB_ENV
+          $timeout = [int]($config.job.timeoutSeconds)
+          if ($timeout -le 0) { $timeout = 900 }
+          "JOB_TIMEOUT_SECONDS=$timeout" | Add-Content -Path $env:GITHUB_ENV
+
+      - name: Run isolation job
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/run-database-job.sh \
+            --manifest k8s/db-isolation-job.yaml \
+            --job-name "oficina-db-isolation-${GITHUB_RUN_ID}" \
+            --secret-name oficina-db-isolation-credentials \
+            --secret-source isolation \
+            --summary-title 'Matriz de isolamento 6 x 3'
 
   provision-admin:
     name: Provision initial Admin user
-    needs: bootstrap
+    needs: database-isolation
     if: ${{ inputs.provision_admin_user }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      AWS_REGION: ${{ vars.AWS_REGION }}
-      ECS_TASK_EXECUTION_ROLE_ARN: ${{ vars.ECS_TASK_EXECUTION_ROLE_ARN }}
-      ECS_TASK_ROLE_ARN: ${{ vars.ECS_TASK_ROLE_ARN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -283,10 +229,8 @@ jobs:
           if ($env:GITHUB_REF -ne 'refs/heads/main') {
             throw 'This workflow must run from main.'
           }
-          foreach ($name in @('AWS_REGION', 'ECS_TASK_EXECUTION_ROLE_ARN', 'ECS_TASK_ROLE_ARN')) {
-            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
-              throw "Repository Variable $name is required."
-            }
+          if ([string]::IsNullOrWhiteSpace($env:AWS_REGION)) {
+            throw 'Repository Variable AWS_REGION is required.'
           }
 
           # O job so provisiona o usuario e a senha que estiverem nos Secrets.
@@ -350,142 +294,80 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Validate AWS identity
-        shell: pwsh
-        run: aws sts get-caller-identity
-
-      - name: Resolve AWS metadata
+      - name: Resolve cluster and database metadata
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           function Get-Ssm([string]$name) {
             $v = aws ssm get-parameter --name $name --region $env:AWS_REGION --query 'Parameter.Value' --output text
-            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($v) -or $v -eq 'None') {
-              throw "Missing or empty SSM parameter: $name"
-            }
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($v) -or $v -eq 'None') { throw "Missing or empty SSM parameter: $name" }
             return $v.Trim()
           }
-          function Get-SecretArn([string]$id) {
-            $v = aws secretsmanager describe-secret --secret-id $id --region $env:AWS_REGION --query 'ARN' --output text
-            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($v) -or $v -eq 'None') {
-              throw "Secret not found: $id"
-            }
-            return $v.Trim()
-          }
-
           $config = Get-Content -LiteralPath 'config/database-bootstrap.json' -Raw | ConvertFrom-Json
-          $clusterName = Get-Ssm $config.ecs.clusterNameParameter
-          $subnet1 = Get-Ssm $config.ecs.privateSubnet1Parameter
-          $subnet2 = Get-Ssm $config.ecs.privateSubnet2Parameter
-          $securityGroup = Get-Ssm $config.ecs.taskSecurityGroupParameter
-          $repository = Get-Ssm $config.ecs.imageRepositoryParameter
-          $rdsHost = Get-Ssm $config.rds.endpointParameter
-          $rdsPort = Get-Ssm $config.rds.portParameter
-          $masterArn = Get-SecretArn $config.rds.masterSecretArnParameter
+          "K8S_NAMESPACE=$(Get-Ssm $config.kubernetes.namespaceParameter)" | Add-Content -Path $env:GITHUB_ENV
+          "K8S_INSTANCE_ID=$(Get-Ssm $config.kubernetes.instanceIdParameter)" | Add-Content -Path $env:GITHUB_ENV
+          "BOOTSTRAP_IMAGE=$(Get-Ssm $config.kubernetes.imageRepositoryParameter):$env:GITHUB_SHA" | Add-Content -Path $env:GITHUB_ENV
+          "RDS_HOST=$(Get-Ssm $config.rds.endpointParameter)" | Add-Content -Path $env:GITHUB_ENV
+          "RDS_PORT=$(Get-Ssm $config.rds.portParameter)" | Add-Content -Path $env:GITHUB_ENV
+          "MASTER_SECRET_ID=$(Get-Ssm $config.rds.masterSecretArnParameter)" | Add-Content -Path $env:GITHUB_ENV
+          $timeout = [int]($config.job.timeoutSeconds)
+          if ($timeout -le 0) { $timeout = 900 }
+          "JOB_TIMEOUT_SECONDS=$timeout" | Add-Content -Path $env:GITHUB_ENV
 
-          if ($rdsPort -notmatch '^\d+$') { throw "Invalid RDS port in SSM: $rdsPort" }
-
-          "CLUSTER_NAME=$clusterName" | Add-Content -Path $env:GITHUB_ENV
-          "PRIVATE_SUBNET_1=$subnet1" | Add-Content -Path $env:GITHUB_ENV
-          "PRIVATE_SUBNET_2=$subnet2" | Add-Content -Path $env:GITHUB_ENV
-          "TASK_SECURITY_GROUP_ID=$securityGroup" | Add-Content -Path $env:GITHUB_ENV
-          # Reusa a imagem ja construida e publicada pelo job bootstrap deste mesmo run.
-          "BOOTSTRAP_IMAGE=${repository}:$env:GITHUB_SHA" | Add-Content -Path $env:GITHUB_ENV
-          "RDS_HOST=$rdsHost" | Add-Content -Path $env:GITHUB_ENV
-          "RDS_PORT=$rdsPort" | Add-Content -Path $env:GITHUB_ENV
-          "MASTER_SECRET_ARN=$masterArn" | Add-Content -Path $env:GITHUB_ENV
-
-          $runTaskTimeout = [int]($config.runTask.timeoutSeconds)
-          if ($runTaskTimeout -le 0) { $runTaskTimeout = 900 }
-          "RUN_TASK_TIMEOUT_SECONDS=$runTaskTimeout" | Add-Content -Path $env:GITHUB_ENV
-          Write-Host 'Resolved ECS, RDS, ECR and master secret metadata.'
-
-      - name: Register task definition
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $container = @{
-            name = 'admin-provision'
-            image = $env:BOOTSTRAP_IMAGE
-            essential = $true
-            command = @('/opt/bootstrap/provision-admin-user.sh')
-            environment = @(
-              @{ name = 'AWS_REGION'; value = $env:AWS_REGION },
-              @{ name = 'RDS_HOST'; value = $env:RDS_HOST },
-              @{ name = 'RDS_PORT'; value = $env:RDS_PORT },
-              @{ name = 'ADMIN_CPF'; value = $env:ADMIN_CPF },
-              @{ name = 'ADMIN_NOME'; value = $env:ADMIN_NOME },
-              # Somente o hash PBKDF2 trafega. A senha em claro fica no runner.
-              @{ name = 'ADMIN_SENHA_HASH'; value = $env:ADMIN_SENHA_HASH }
-            )
-            secrets = @(
-              @{ name = 'MASTER_USERNAME'; valueFrom = "$($env:MASTER_SECRET_ARN):username::" },
-              @{ name = 'MASTER_PASSWORD'; valueFrom = "$($env:MASTER_SECRET_ARN):password::" }
-            )
-            logConfiguration = @{
-              logDriver = 'awslogs'
-              options = @{
-                'awslogs-group' = '/ecs/oficina/db-bootstrap'
-                'awslogs-region' = $env:AWS_REGION
-                'awslogs-stream-prefix' = 'provision-admin'
-              }
-            }
-          }
-          $taskDefinition = @{
-            family = 'oficina-admin-provision'
-            networkMode = 'awsvpc'
-            requiresCompatibilities = @('FARGATE')
-            cpu = '512'
-            memory = '1024'
-            executionRoleArn = $env:ECS_TASK_EXECUTION_ROLE_ARN
-            taskRoleArn = $env:ECS_TASK_ROLE_ARN
-            containerDefinitions = @($container)
-          }
-          $path = Join-Path $env:RUNNER_TEMP 'admin-provision-taskdef.json'
-          $taskDefinition | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $path -Encoding utf8
-          $arn = aws ecs register-task-definition --cli-input-json "file://$path" --region $env:AWS_REGION --query 'taskDefinition.taskDefinitionArn' --output text
-          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($arn)) { throw 'Failed to register admin provisioning task definition.' }
-          "ADMIN_TASK_DEFINITION_ARN=$arn" | Add-Content -Path $env:GITHUB_ENV
-
-      - name: Run admin provisioning task
+      - name: Stage the admin hash as a SecureString
+        id: stage
         shell: bash
         run: |
           set -euo pipefail
-          task_arn=$(aws ecs run-task \
-            --cluster "$CLUSTER_NAME" \
-            --launch-type FARGATE \
-            --started-by provision-admin \
-            --task-definition "$ADMIN_TASK_DEFINITION_ARN" \
-            --network-configuration "awsvpcConfiguration={subnets=[$PRIVATE_SUBNET_1,$PRIVATE_SUBNET_2],securityGroups=[$TASK_SECURITY_GROUP_ID],assignPublicIp=DISABLED}" \
-            --region "$AWS_REGION" \
-            --query 'tasks[0].taskArn' \
-            --output text)
-          if [ -z "$task_arn" ] || [ "$task_arn" = "None" ]; then
-            echo "ECS run-task did not return a task ARN." >&2
-            exit 1
-          fi
-          echo "ADMIN_TASK_ARN=$task_arn" >> "$GITHUB_ENV"
-          timeout_seconds="${RUN_TASK_TIMEOUT_SECONDS:-900}"
-          deadline=$(( $(date +%s) + timeout_seconds ))
-          while true; do
-            last_status=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query 'tasks[0].lastStatus' --output text)
-            if [ "$last_status" = "STOPPED" ]; then
-              break
-            fi
-            if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "Admin provisioning task did not stop within ${timeout_seconds}s (last status: ${last_status})." >&2
+          parameter="/oficina/deploy/admin-provision/${GITHUB_RUN_ID}/senha-hash"
+
+          # ssm:DeleteParameter e pre-requisito obrigatorio. Sem ele o parametro
+          # nao e criado: sobrescrever nao apaga o valor, so acrescenta versao.
+          # Aqui nao ha fallback aceitavel, porque o unico caminho alternativo
+          # colocaria o hash no corpo do Run Command.
+          for action in ssm:PutParameter ssm:DeleteParameter ssm:GetParameter; do
+            decision=$(aws iam simulate-principal-policy \
+              --policy-source-arn "$(aws sts get-caller-identity --query Arn --output text)" \
+              --action-names "$action" \
+              --context-entries "ContextKeyName=aws:RequestedRegion,ContextKeyType=string,ContextKeyValues=$AWS_REGION" \
+              --query 'EvaluationResults[0].EvalDecision' --output text 2>/dev/null || echo unknown)
+            echo "$action -> $decision"
+            if [ "$decision" = "explicitDeny" ] || [ "$decision" = "implicitDeny" ]; then
+              echo "Permissao $action indisponivel. O provisionamento do Admin foi interrompido antes de criar qualquer parametro." >&2
               exit 1
             fi
-            sleep 15
           done
-          exit_code=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query "tasks[0].containers[?name==\`admin-provision\`].exitCode | [0]" --output text)
-          stopped_reason=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query 'tasks[0].stoppedReason' --output text)
-          echo "Task stopped: $stopped_reason"
-          if [ "$exit_code" != "0" ]; then
-            echo "Admin provisioning task failed with exit code $exit_code." >&2
-            echo "Check the /ecs/oficina/db-bootstrap log group, stream prefix provision-admin." >&2
+
+          umask 077
+          payload=$(mktemp)
+          trap 'rm -f "$payload"' EXIT
+          jq -n --arg n "$parameter" --arg v "$ADMIN_SENHA_HASH" \
+            '{Name: $n, Value: $v, Type: "SecureString", KeyId: "alias/aws/ssm", Overwrite: false}' > "$payload"
+          aws ssm put-parameter --cli-input-json "file://$payload" --region "$AWS_REGION" >/dev/null
+          echo "parameter=$parameter" >> "$GITHUB_OUTPUT"
+          echo "HASH_PARAMETER=$parameter" >> "$GITHUB_ENV"
+
+      - name: Run admin provisioning job
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/run-database-job.sh \
+            --manifest k8s/admin-provision-job.yaml \
+            --job-name "oficina-admin-provision-${GITHUB_RUN_ID}" \
+            --secret-name oficina-admin-provision-credentials \
+            --secret-source admin
+
+      - name: Remove the staged SecureString
+        if: always() && steps.stage.outputs.parameter != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ssm delete-parameter --name "${{ steps.stage.outputs.parameter }}" --region "$AWS_REGION" >/dev/null 2>&1 || true
+          if aws ssm get-parameter --name "${{ steps.stage.outputs.parameter }}" --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo 'O parametro temporario ainda existe apos a exclusao.' >&2
             exit 1
           fi
+          echo 'Parametro temporario removido.'
 
       - name: Publish summary
         if: always()
@@ -495,14 +377,15 @@ jobs:
           $lines = @()
           $lines += '## Initial Admin provisioning'
           $lines += ''
-          $lines += "Cluster: $env:CLUSTER_NAME"
-          $lines += "Task definition: $env:ADMIN_TASK_DEFINITION_ARN"
-          $lines += "Task: $env:ADMIN_TASK_ARN"
+          $lines += "Namespace: $env:K8S_NAMESPACE"
+          $lines += "Job: oficina-admin-provision-$env:GITHUB_RUN_ID"
           $lines += "Image: $env:BOOTSTRAP_IMAGE"
           $lines += ''
           $lines += 'Scope: a single row in OficinaCadastroDb.dbo.Funcionarios, matching ADMIN_INICIAL_CPF.'
           $lines += 'No database, login, user, role or permission was created or changed by this job.'
-          $lines += 'The plaintext password never left the runner: only the PBKDF2 hash was sent to the task.'
+          $lines += 'The plaintext password never left the runner. Only the PBKDF2 hash was staged, as a'
+          $lines += 'SecureString whose name (never its value) travelled in the Run Command, and the'
+          $lines += 'parameter was deleted afterwards.'
           $lines += ''
           $lines += 'Use these credentials as loginCpf and loginPassword in the Postman environment'
           $lines += 'oficina-main-flow of the oficina-ordens-servico repository.'

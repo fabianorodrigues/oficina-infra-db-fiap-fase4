@@ -183,9 +183,9 @@ sed -i \
     -e "s|__RDS_PORT__|${DB_PORT}|g" \
     "$WORK/job.yaml"
 
-if grep -qE '__[A-Z_]+__' "$WORK/job.yaml"; then
+if grep -qE '__[A-Z0-9_]+__' "$WORK/job.yaml"; then
     echo 'Placeholder nao substituido no manifesto.' >&2
-    grep -nE '__[A-Z_]+__' "$WORK/job.yaml" >&2
+    grep -nE '__[A-Z0-9_]+__' "$WORK/job.yaml" >&2
     exit 1
 fi
 
