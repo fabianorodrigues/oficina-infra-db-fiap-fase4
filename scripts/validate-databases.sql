@@ -1,12 +1,8 @@
--- =============================================================================
--- validate-databases.sql
--- -----------------------------------------------------------------------------
 -- Validacao estritamente READ-ONLY do estado produzido por
 -- bootstrap-databases.sql. Nao altera estado, nao le secrets, nao imprime
 -- senhas. Acumula falhas em uma tabela temporaria de sessao e, ao final,
 -- lanca RAISERROR (severidade 16) caso qualquer verificacao falhe, fazendo o
 -- sqlcmd (-b) encerrar com codigo diferente de zero.
--- =============================================================================
 
 SET NOCOUNT ON;
 GO
@@ -15,14 +11,12 @@ IF OBJECT_ID('tempdb..#failures') IS NOT NULL DROP TABLE #failures;
 CREATE TABLE #failures (reason nvarchar(400) NOT NULL);
 GO
 
--- -----------------------------------------------------------------------------
--- 1. Contexto master: bancos e logins.
--- -----------------------------------------------------------------------------
+-- Contexto master: bancos e logins.
 IF DB_ID(N'OficinaCadastroDb')      IS NULL INSERT INTO #failures VALUES (N'Banco ausente: OficinaCadastroDb');
 IF DB_ID(N'OficinaEstoqueDb')       IS NULL INSERT INTO #failures VALUES (N'Banco ausente: OficinaEstoqueDb');
 IF DB_ID(N'OficinaOrdensServicoDb') IS NULL INSERT INTO #failures VALUES (N'Banco ausente: OficinaOrdensServicoDb');
 
--- 1.1 Sete logins existem.
+-- Sete logins existem.
 DECLARE @logins TABLE (name sysname PRIMARY KEY);
 INSERT INTO @logins (name) VALUES
     (N'cadastro_app'), (N'cadastro_migrator'),
@@ -35,7 +29,7 @@ SELECT N'Login ausente: ' + l.name
 FROM @logins l
 WHERE SUSER_ID(l.name) IS NULL;
 
--- 1.2 Todos os logins habilitados.
+-- Todos os logins habilitados.
 INSERT INTO #failures (reason)
 SELECT N'Login desabilitado ou nao-SQL: ' + l.name
 FROM @logins l
@@ -45,9 +39,7 @@ WHERE NOT EXISTS (
 );
 GO
 
--- -----------------------------------------------------------------------------
--- 2. OficinaCadastroDb.
--- -----------------------------------------------------------------------------
+-- OficinaCadastroDb.
 USE [OficinaCadastroDb];
 GO
 
@@ -92,9 +84,7 @@ IF EXISTS (SELECT 1 FROM sys.database_principals WHERE name IN (N'estoque_app', 
     INSERT INTO #failures VALUES (N'Usuario gerenciado indevido presente em Cadastro');
 GO
 
--- -----------------------------------------------------------------------------
--- 3. OficinaEstoqueDb.
--- -----------------------------------------------------------------------------
+-- OficinaEstoqueDb.
 USE [OficinaEstoqueDb];
 GO
 
@@ -114,9 +104,7 @@ IF EXISTS (SELECT 1 FROM sys.database_principals WHERE name IN (N'cadastro_app',
     INSERT INTO #failures VALUES (N'Usuario gerenciado indevido presente em Estoque');
 GO
 
--- -----------------------------------------------------------------------------
--- 4. OficinaOrdensServicoDb.
--- -----------------------------------------------------------------------------
+-- OficinaOrdensServicoDb.
 USE [OficinaOrdensServicoDb];
 GO
 
@@ -136,9 +124,7 @@ IF EXISTS (SELECT 1 FROM sys.database_principals WHERE name IN (N'cadastro_app',
     INSERT INTO #failures VALUES (N'Usuario gerenciado indevido presente em Ordens');
 GO
 
--- -----------------------------------------------------------------------------
--- 5. Resultado final.
--- -----------------------------------------------------------------------------
+-- Resultado final.
 USE [master];
 GO
 

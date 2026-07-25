@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
-# =============================================================================
-# provision-admin-user.sh
-# -----------------------------------------------------------------------------
 # Executado dentro de uma ECS Run Task, na mesma imagem do bootstrap. Le a
-# identidade master do RDS a partir dos secrets injetados pelo ECS e os dados do
-# admin inicial (CPF, nome e hash PBKDF2) a partir de variaveis de ambiente,
-# renderiza o SQL em um arquivo temporario em RAM e executa o provisionamento.
+# identidade master do RDS dos secrets injetados pelo ECS e os dados do admin
+# inicial (CPF, nome e hash PBKDF2) de variaveis de ambiente, renderiza o SQL em
+# arquivo temporario restrito e executa o provisionamento idempotente.
+
+# Os marcadores ($(ADMIN_*_SQL)) sao strings literais propositais, substituidas
+# por literais T-SQL antes do sqlcmd. Nao devem expandir no shell.
+# shellcheck disable=SC2016
 
 set -euo pipefail
 
-# -----------------------------------------------------------------------------
-# Configuracao (nao sensivel). Sobrescrevivel por variavel de ambiente.
-# -----------------------------------------------------------------------------
 SCRIPTS_DIR="${SCRIPTS_DIR:-/opt/bootstrap/scripts}"
 WORK_DIR="${WORK_DIR:-/work}"
 SQL_ENCRYPT_TRUST_SERVER_CERT="${SQL_ENCRYPT_TRUST_SERVER_CERT:-true}"
@@ -22,9 +20,6 @@ RENDERED_SQL="${WORK_DIR}/provision-admin-user.rendered.sql"
 log() { printf '%s %s\n' "[provision-admin]" "$*"; }
 fail() { printf '%s %s\n' "[provision-admin][ERRO]" "$*" >&2; exit 1; }
 
-# -----------------------------------------------------------------------------
-# Limpeza garantida de artefatos e segredos em memoria.
-# -----------------------------------------------------------------------------
 cleanup() {
     local status=$?
     if [ -f "$RENDERED_SQL" ]; then
@@ -39,9 +34,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# -----------------------------------------------------------------------------
-# Localiza o binario sqlcmd (imagem mssql-tools18 ou PATH).
-# -----------------------------------------------------------------------------
 SQLCMD=""
 for candidate in \
     "${SQLCMD_PATH:-}" \
@@ -54,19 +46,12 @@ if [ -z "$SQLCMD" ] && command -v sqlcmd >/dev/null 2>&1; then
 fi
 [ -n "$SQLCMD" ] || fail "sqlcmd nao encontrado na imagem."
 
-# -----------------------------------------------------------------------------
-# 1. Endpoint e porta (nao sensiveis) chegam por variavel de ambiente do Job.
-# -----------------------------------------------------------------------------
 [ -n "${RDS_HOST:-}" ] || fail "RDS_HOST ausente."
 [ -n "${RDS_PORT:-}" ] || fail "RDS_PORT ausente."
 case "$RDS_PORT" in
     ''|*[!0-9]*) fail "RDS_PORT invalido." ;;
 esac
 
-# -----------------------------------------------------------------------------
-# 2. Leitura segura de variavel de ambiente, rejeitando CR, LF e NUL.
-#    O valor jamais e impresso.
-# -----------------------------------------------------------------------------
 read_secret_value() {
     local env_name="$1"
     local label="$2"
@@ -92,9 +77,6 @@ ADMIN_CPF_RAW="$(read_secret_value ADMIN_CPF 'ADMIN_INICIAL_CPF')"
 ADMIN_NOME_RAW="$(read_secret_value ADMIN_NOME 'ADMIN_NOME')"
 ADMIN_SENHA_HASH_RAW="$(read_secret_value ADMIN_SENHA_HASH 'ADMIN_SENHA_HASH')"
 
-# -----------------------------------------------------------------------------
-# 3. Validacao estrita dos dados do admin, antes de qualquer conexao.
-# -----------------------------------------------------------------------------
 case "$ADMIN_CPF_RAW" in
     *[!0-9]*) fail "ADMIN_INICIAL_CPF deve conter apenas digitos." ;;
 esac
@@ -119,9 +101,6 @@ esac
 hash_partes="$(printf '%s' "$ADMIN_SENHA_HASH_RAW" | tr -cd '$' | wc -c | tr -d '[:space:]')"
 [ "$hash_partes" = "3" ] || fail "ADMIN_SENHA_HASH deve ter o formato PBKDF2-SHA256\$iteracoes\$salt\$hash."
 
-# -----------------------------------------------------------------------------
-# 4. Escape T-SQL e renderizacao do SQL em memoria (substituicao literal).
-# -----------------------------------------------------------------------------
 ADMIN_CPF_SQL="$(escape_tsql "$ADMIN_CPF_RAW")"
 ADMIN_NOME_SQL="$(escape_tsql "$ADMIN_NOME_RAW")"
 ADMIN_SENHA_HASH_SQL="$(escape_tsql "$ADMIN_SENHA_HASH_RAW")"
@@ -150,11 +129,6 @@ done
 
 unset ADMIN_CPF_SQL ADMIN_NOME_SQL ADMIN_SENHA_HASH_SQL
 
-# -----------------------------------------------------------------------------
-# 5. Portao de escopo: o SQL renderizado so pode provisionar o admin inicial.
-#    Comentarios sao descartados antes da inspecao para nao gerar falso positivo,
-#    e a comparacao e feita em maiusculas.
-# -----------------------------------------------------------------------------
 sql_executavel="$(printf '%s\n' "$rendered" | sed 's/--.*$//' | tr '[:lower:]' '[:upper:]')"
 
 for proibido in \
@@ -194,9 +168,6 @@ mkdir -p "$WORK_DIR"
 chmod 600 "$RENDERED_SQL" 2>/dev/null || true
 unset rendered sql_executavel
 
-# -----------------------------------------------------------------------------
-# 6. Argumentos de conexao. Conexao sempre criptografada (-N).
-# -----------------------------------------------------------------------------
 conn_args=(-S "tcp:${RDS_HOST},${RDS_PORT}" -U "$MASTER_USER" -d master -l "$LOGIN_TIMEOUT" -b -x -N)
 if [ "$SQL_ENCRYPT_TRUST_SERVER_CERT" = "true" ]; then
     conn_args+=(-C)
@@ -208,9 +179,6 @@ unset MASTER_PASSWORD
 
 log "Conectando ao RDS em ${RDS_HOST}:${RDS_PORT} como usuario master (senha via SQLCMDPASSWORD)."
 
-# -----------------------------------------------------------------------------
-# 7. Execucao do provisionamento idempotente.
-# -----------------------------------------------------------------------------
 log "Provisionando o admin inicial em OficinaCadastroDb.dbo.Funcionarios..."
 if ! "$SQLCMD" "${conn_args[@]}" -i "$RENDERED_SQL"; then
     fail "Falha ao provisionar o admin inicial."

@@ -57,17 +57,11 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-# ---------------------------------------------------------------------------
-# Deteccao de plataforma compativel com 5.1 e 7.
-# ---------------------------------------------------------------------------
 $isWindowsPlatform = $true
 if (Test-Path -Path 'variable:IsWindows') { $isWindowsPlatform = [bool]$IsWindows }
 
 $inGitHubActions = ($env:GITHUB_ACTIONS -eq 'true')
 
-# ---------------------------------------------------------------------------
-# Funcoes auxiliares.
-# ---------------------------------------------------------------------------
 function Add-GitHubMask {
     param([string]$Value)
     if ($inGitHubActions -and -not [string]::IsNullOrEmpty($Value)) {
@@ -211,9 +205,6 @@ function Get-IdempotencyToken {
     return -join ($hash | ForEach-Object { $_.ToString('x2') })
 }
 
-# ---------------------------------------------------------------------------
-# 1. Carregar e validar o contrato.
-# ---------------------------------------------------------------------------
 if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     throw "Contrato de secrets nao encontrado: $ConfigPath"
 }
@@ -239,9 +230,6 @@ $rds = Get-PropertyValue -Object $config -Name 'rds'
 $endpointParameter = [string](Get-PropertyValue -Object $rds -Name 'endpointParameter')
 $portParameter = [string](Get-PropertyValue -Object $rds -Name 'portParameter')
 
-# ---------------------------------------------------------------------------
-# Validacao de parametros mutuamente exclusivos.
-# ---------------------------------------------------------------------------
 $hasServerOverride = -not [string]::IsNullOrWhiteSpace($ServerOverride)
 $hasPortOverride = $PSBoundParameters.ContainsKey('PortOverride')
 
@@ -254,9 +242,6 @@ if (-not $DryRun) {
     }
 }
 
-# ---------------------------------------------------------------------------
-# Resolucao de endpoint e porta.
-# ---------------------------------------------------------------------------
 $server = $null
 $port = 0
 $awsCallsExecuted = 0
@@ -268,26 +253,21 @@ if ($DryRun) {
     $port = $PortOverride
 }
 else {
-    # 2. Confirmar identidade AWS.
     $identity = (Invoke-Aws -Arguments @('sts', 'get-caller-identity', '--output', 'json')).Output | ConvertFrom-Json
     $awsCallsExecuted++
     Write-Host "Identidade AWS confirmada para a conta $($identity.Account)."
 
-    # 3. Endpoint pelo SSM.
     $endpointJson = (Invoke-Aws -Arguments @('ssm', 'get-parameter', '--name', $endpointParameter, '--region', $Region, '--output', 'json')).Output | ConvertFrom-Json
     $awsCallsExecuted++
     $server = [string]$endpointJson.Parameter.Value
 
-    # 4. Porta pelo SSM.
     $portJson = (Invoke-Aws -Arguments @('ssm', 'get-parameter', '--name', $portParameter, '--region', $Region, '--output', 'json')).Output | ConvertFrom-Json
     $awsCallsExecuted++
     $portRaw = [string]$portJson.Parameter.Value
 
-    # 5. Endpoint nao vazio.
     if ([string]::IsNullOrWhiteSpace($server)) {
         throw "O endpoint do RDS retornado pelo SSM ($endpointParameter) esta vazio."
     }
-    # 6. Porta numerica.
     $parsedPort = 0
     if (-not [int]::TryParse($portRaw, [ref]$parsedPort) -or $parsedPort -lt 1 -or $parsedPort -gt 65535) {
         throw "A porta do RDS retornada pelo SSM ($portParameter) nao e um numero valido."
@@ -295,9 +275,7 @@ else {
     $port = $parsedPort
 }
 
-# ---------------------------------------------------------------------------
-# 7. Validar os sete containers antes de qualquer escrita (somente modo real).
-# ---------------------------------------------------------------------------
+# Validar os sete containers antes de qualquer escrita (somente modo real).
 if (-not $DryRun) {
     foreach ($target in $targets) {
         $secretName = [string](Get-PropertyValue -Object $target -Name 'secretName')
@@ -310,9 +288,6 @@ if (-not $DryRun) {
     }
 }
 
-# ---------------------------------------------------------------------------
-# 8-16. Construcao dos payloads e sincronizacao.
-# ---------------------------------------------------------------------------
 $results = [System.Collections.Generic.List[object]]::new()
 $payloadCount = 0
 
@@ -322,24 +297,21 @@ foreach ($target in $targets) {
     $username = [string](Get-PropertyValue -Object $target -Name 'username')
     $envVar = [string](Get-PropertyValue -Object $target -Name 'passwordEnvironmentVariable')
 
-    # 8-9. Ler e mascarar a senha.
     $password = Get-ValidatedPassword -EnvironmentVariable $envVar
 
-    # 10. Connection string com builder seguro.
     $connectionString = New-SqlConnectionString `
         -Server $server -Port $port -Database $database -Username $username `
         -Password $password -Encrypt $encrypt -TrustServerCertificate $trustServerCertificate `
         -ConnectTimeoutSeconds $connectTimeoutSeconds
     Add-GitHubMask -Value $connectionString
 
-    # 11. Payload JSON em memoria.
     $payloadJson = New-SecretPayloadJson `
         -Server $server -Port $port -Database $database -Username $username `
         -Password $password -Encrypt $encrypt -TrustServerCertificate $trustServerCertificate `
         -ConnectTimeoutSeconds $connectTimeoutSeconds -ConnectionString $connectionString
     $payloadCount++
 
-    # 12. Token idempotente derivado do payload completo.
+    # Token idempotente derivado do payload completo.
     $clientRequestToken = Get-IdempotencyToken -SecretName $secretName -PayloadJson $payloadJson
 
     $versionId = ''
@@ -354,13 +326,13 @@ foreach ($target in $targets) {
                 try { & chmod 700 $tempDirectory 2>$null } catch { }
             }
 
-            # 3. Permissao restritiva no arquivo, quando suportado.
+            # Permissao restritiva no arquivo, quando suportado.
             [System.IO.File]::WriteAllText($tempFile, $payloadJson, [System.Text.UTF8Encoding]::new($false))
             if (-not $isWindowsPlatform) {
                 try { & chmod 600 $tempFile 2>$null } catch { }
             }
 
-            # 13. put-secret-value com --secret-string file:// e token idempotente.
+            # put-secret-value com --secret-string file:// e token idempotente.
             $putResult = (Invoke-Aws -Arguments @(
                 'secretsmanager', 'put-secret-value',
                 '--secret-id', $secretName,
@@ -371,7 +343,7 @@ foreach ($target in $targets) {
             )).Output | ConvertFrom-Json
             $awsCallsExecuted++
 
-            # 15. Validar somente ARN, Name e VersionId (sem ler o conteudo).
+            # Validar somente ARN, Name e VersionId (sem ler o conteudo).
             $returnedArn = [string](Get-PropertyValue -Object $putResult -Name 'ARN')
             $returnedName = [string](Get-PropertyValue -Object $putResult -Name 'Name')
             $versionId = [string](Get-PropertyValue -Object $putResult -Name 'VersionId')
@@ -384,7 +356,7 @@ foreach ($target in $targets) {
             $status = 'Sincronizado'
         }
         finally {
-            # 5-6. Limpeza garantida do arquivo e do diretorio temporario.
+            # Limpeza garantida do arquivo e do diretorio temporario.
             if (Test-Path -LiteralPath $tempFile) { Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue }
             if (Test-Path -LiteralPath $tempDirectory) { Remove-Item -LiteralPath $tempDirectory -Recurse -Force -ErrorAction SilentlyContinue }
         }
@@ -405,9 +377,6 @@ foreach ($target in $targets) {
     $payloadJson = $null
 }
 
-# ---------------------------------------------------------------------------
-# 17. Resumo sanitizado.
-# ---------------------------------------------------------------------------
 $results | Format-Table -AutoSize
 
 if ($DryRun) {

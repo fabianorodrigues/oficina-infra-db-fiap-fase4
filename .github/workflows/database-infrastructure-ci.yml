@@ -75,7 +75,7 @@ jobs:
 
       - name: ShellCheck
         shell: bash
-        run: shellcheck --shell=bash scripts/run-database-bootstrap.sh
+        run: shellcheck --shell=bash scripts/run-database-bootstrap.sh scripts/provision-admin-user.sh
 
       - name: Validate contracts
         shell: pwsh
