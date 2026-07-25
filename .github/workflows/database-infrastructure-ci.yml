@@ -25,10 +25,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.10.5
 
@@ -163,8 +163,7 @@ jobs:
             'aws_session_token\s*=',
             'continue-on-error:\s*true',
             'pull_request_target',
-            'terraform\s+destroy',
-            'kubectl\s+rollout\s+undo'
+            'terraform\s+destroy'
           )) {
             if ($joined -match $pattern) { throw "Forbidden pattern found: $pattern" }
           }

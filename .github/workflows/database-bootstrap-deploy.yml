@@ -35,7 +35,7 @@ jobs:
       ECS_TASK_ROLE_ARN: ${{ vars.ECS_TASK_ROLE_ARN }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Validate request
         shell: pwsh
@@ -63,7 +63,7 @@ jobs:
           ./scripts/validate-database-bootstrap-config.ps1 -ConfigPath config/database-bootstrap.json -SecretsConfigPath config/database-secrets.json
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -271,7 +271,7 @@ jobs:
       ECS_TASK_ROLE_ARN: ${{ vars.ECS_TASK_ROLE_ARN }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Validate request and derive password hash
         shell: pwsh
@@ -343,7 +343,7 @@ jobs:
           Write-Host 'Admin secrets validated and password hash derived. No sensitive value was printed.'
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}

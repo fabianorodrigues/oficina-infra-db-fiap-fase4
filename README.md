@@ -31,11 +31,11 @@ A **Oficina** é uma plataforma de gestão de oficina mecânica implantada na AW
 | Repositório | Responsabilidade | Etapas |
 |---|---|:---:|
 | **oficina-infra-db** *(este)* | Rede, banco de dados, segredos e estado do Terraform | 1 e 3 |
-| [oficina-infra](https://github.com/fabianorodrigues/oficina-infra-fiap-fase4) | Plataforma ECS/ALB e entrada de API | 2, 6 e 7 |
+| [oficina-infra](https://github.com/fabianorodrigues/oficina-infra-fiap-fase4) | Plataforma ECS/ALB e entrada de API | 2 e 8 |
 | [oficina-auth-lambda](https://github.com/fabianorodrigues/oficina-auth-lambda-fiap-fase4) | Autenticação por CPF e validação de token | 4 |
 | [oficina-cadastro](https://github.com/fabianorodrigues/oficina-cadastro-fiap-fase4) | Clientes, veículos, funcionários e catálogo de serviços | 5 |
-| [oficina-estoque](https://github.com/fabianorodrigues/oficina-estoque-fiap-fase4) | Peças, insumos, saldos e reservas | 5 |
-| [oficina-ordens-servico](https://github.com/fabianorodrigues/oficina-ordens-servico-fiap-fase4) | Ordens de serviço, orçamento e saga de pagamento | 5 e 8 |
+| [oficina-estoque](https://github.com/fabianorodrigues/oficina-estoque-fiap-fase4) | Peças, insumos, saldos e reservas | 6 |
+| [oficina-ordens-servico](https://github.com/fabianorodrigues/oficina-ordens-servico-fiap-fase4) | Ordens de serviço, orçamento e saga de pagamento | 7 e 9 |
 
 **Papel deste repositório:** é a raiz da solução. Provisiona a rede (VPC), o banco (RDS SQL Server), os contêineres de segredo do banco e o bucket S3 que armazena o **estado do Terraform de todos os stacks**. Nada é implantado sem que esta etapa exista.
 
@@ -51,10 +51,13 @@ Os repositórios têm dependências reais entre si. Esta é a sequência obrigat
 | 2 | oficina-infra | Platform Deploy | `APPLY` |
 | **3** | **oficina-infra-db** | **Database Bootstrap** | `BOOTSTRAP` |
 | 4 | oficina-auth-lambda | Auth Deploy | `DEPLOY` |
-| 5 | cadastro · estoque · ordens-servico | Deploy | `DEPLOY` |
-| 6 | oficina-infra | Entrypoint Deploy | `APPLY` |
-| 7 | oficina-infra | Observability Validate | — |
-| 8 | oficina-ordens-servico | AWS E2E Validate | `VALIDATE` |
+| 5 | oficina-cadastro | Cadastro Deploy | `DEPLOY` |
+| 6 | oficina-estoque | Estoque Deploy | `DEPLOY` |
+| 7 | oficina-ordens-servico | Ordens Deploy | `DEPLOY` |
+| 8 | oficina-infra | Entrypoint Deploy | `APPLY` |
+| 9 | oficina-ordens-servico | Collection Postman (execução manual) | — |
+
+As etapas 5, 6 e 7 não dependem entre si e podem rodar em paralelo; a numeração indica a ordem recomendada. Após a etapa 8, o workflow **Observability Validate** (oficina-infra) está disponível como validação **opcional** e somente leitura.
 
 > [!IMPORTANT]
 > **Este repositório abre e retoma a sequência.** A **etapa 1** cria o bucket S3 de estado usado por todos os stacks — sem ela, os deploys de plataforma, autenticação e entrada abortam na verificação do bucket. A **etapa 3** (bootstrap) roda como *ECS Run Task* e depende do cluster ECS e do repositório de imagem criados na etapa 2, por isso não é adjacente à etapa 1.
@@ -144,8 +147,11 @@ Configure em **Settings → Secrets and variables → Actions** do repositório.
 | `SQL_ORDENS_APP_PASSWORD` · `SQL_ORDENS_MIGRATOR_PASSWORD` | Senhas dos logins do banco de ordens | **Sim** |
 | `SQL_AUTH_READ_PASSWORD` | Senha do login de leitura da autenticação | **Sim** |
 | `RDS_ADMIN_CIDR` | CIDR IPv4 (`/32`) autorizado a acessar a porta 1433 para administração via SSMS. Vazio mantém o RDS fechado | Não |
+| `ADMIN_INICIAL_CPF` · `ADMIN_INICIAL_PASSWORD` | Credenciais do usuário administrador inicial. Exigidas **apenas** quando o Database Bootstrap roda com `provision_admin_user = true` | **Sim, para provisionar o admin** |
 
 O deploy verifica a presença das 7 senhas antes de iniciar e falha listando as que faltarem. Use senhas que atendam à política do SQL Server (maiúscula, minúscula, dígito e no mínimo 8 caracteres).
+
+O `ADMIN_INICIAL_CPF` precisa ter exatamente 11 dígitos, sem pontuação, e o `ADMIN_INICIAL_PASSWORD` no máximo 256 caracteres — o workflow valida ambos e falha antes de executar.
 
 ### Variables
 
@@ -203,6 +209,17 @@ Execute **apenas depois** do Platform Deploy (etapa 2), pois roda como task ECS 
 **Actions → Database Bootstrap → Run workflow → `confirmation` = `BOOTSTRAP`**
 
 Constrói a imagem de bootstrap a partir de `SQL_TOOLS_IMAGE`, publica no ECR `db-bootstrap`, registra a *task definition*, executa `aws ecs run-task` em subnets privadas, aguarda a task encerrar e valida o código de saída. Cria os bancos, os logins e as permissões da matriz acima. É idempotente — reexecutar não duplica objetos. As senhas são injetadas como *secrets* da task e não aparecem nos logs.
+
+Deixe o input `provision_admin_user` em `false` nesta primeira execução.
+
+### Usuário administrador inicial — segunda execução do bootstrap
+
+O mesmo workflow tem um job `provision-admin`, ativado pelo input **`provision_admin_user` = `true`**, que grava o administrador inicial na tabela `dbo.Funcionarios` do banco de cadastro.
+
+> [!IMPORTANT]
+> Esse job exige que **as migrations do Cadastro já estejam aplicadas**, ou seja, ele só funciona **depois da etapa 5**. Reexecute o **Database Bootstrap** com `confirmation` = `BOOTSTRAP` e `provision_admin_user` = `true` após publicar o oficina-cadastro. O job `bootstrap` roda novamente antes dele, sem efeito colateral por ser idempotente.
+
+Esse administrador é a credencial usada na **etapa 9**, na validação funcional pela collection Postman. Sem ele, não há como autenticar na API.
 
 ---
 
@@ -266,7 +283,7 @@ terraform validate
 
 ## Limitações conhecidas
 
-- **RDS de instância única**, single-AZ, sem alta disponibilidade e com 1 dia de retenção de backup — dimensionado para ambiente acadêmico.
+- **RDS de instância única**, single-AZ, sem alta disponibilidade e com 1 dia de retenção de backup.
 - **NAT Gateway único** para as duas subnets privadas: ponto único de falha na saída.
 - **Sem monitoramento avançado do banco** (Performance Insights, alarmes, exportação de logs).
 - **Credenciais estáticas** com token de sessão, em vez de federação OIDC.
@@ -275,8 +292,10 @@ terraform validate
 
 ## Próxima etapa
 
-Com a rede, o banco e o bucket de estado disponíveis, prossiga para a etapa 2:
+**Etapa 2 — obrigatória.** Pré-condição: a etapa 1 concluída, com o bucket S3 de estado, a VPC e o RDS `Available`.
 
-**→ [oficina-infra](https://github.com/fabianorodrigues/oficina-infra-fiap-fase4)** — provisiona o cluster ECS, o ALB interno, os repositórios de imagem e as filas.
+**→ [oficina-infra](https://github.com/fabianorodrigues/oficina-infra-fiap-fase4)** — seção [Como executar → Etapa 2](https://github.com/fabianorodrigues/oficina-infra-fiap-fase4#etapa-2--platform-deploy). Provisiona o cluster ECS, o ALB interno, os repositórios de imagem e as filas.
 
-Concluída a etapa 2, **retorne aqui** para executar o **Database Bootstrap** (etapa 3).
+Concluída a etapa 2, **retorne a este README**, seção [Como executar → Etapa 3](#etapa-3--database-bootstrap), para executar o **Database Bootstrap**.
+
+Depois da etapa 5, **retorne mais uma vez** a [Usuário administrador inicial](#usuário-administrador-inicial--segunda-execução-do-bootstrap) para provisionar o administrador exigido pela etapa 9.
