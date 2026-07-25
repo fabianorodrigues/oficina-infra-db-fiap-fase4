@@ -1,0 +1,62 @@
+# Prova negativa do isolamento: 6 logins x 3 bancos, com teste de DDL no banco
+# proprietario. Usa a mesma imagem do bootstrap, que ja reune bash e sqlcmd.
+#
+# O ciclo de vida dos Secrets temporarios e deste Job pertence ao host: o
+# comando SSM remove ambos em bloco finally, que roda em sucesso, falha e
+# timeout. Um Job que se autolimpasse perderia a limpeza exatamente quando
+# falhasse.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oficina-db-isolation-__RUN_ID__
+  namespace: oficina
+  labels:
+    app.kubernetes.io/name: oficina-db-isolation
+    app.kubernetes.io/component: database-validation
+    app.kubernetes.io/part-of: oficina
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oficina-db-isolation
+        app.kubernetes.io/component: database-validation
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: db-isolation
+          image: __BOOTSTRAP_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command:
+            - /opt/bootstrap/validate-database-isolation.sh
+          env:
+            - name: AWS_REGION
+              value: "__AWS_REGION__"
+            - name: RDS_HOST
+              value: "__RDS_HOST__"
+            - name: RDS_PORT
+              value: "__RDS_PORT__"
+          envFrom:
+            - secretRef:
+                name: oficina-db-isolation-credentials
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi

@@ -192,6 +192,103 @@ function Set-RequiredTags {
     }
 }
 
+# Prefixo exclusivo dos pacotes de manifests do deploy Kubernetes. O lifecycle
+# pertence ao proprietario do bucket, que e este script: declara-lo na stack
+# platform criaria dono ambiguo para um bucket de outra stack.
+$K8sDeployPrefix = 'k8s-deploy/'
+$K8sDeployRuleIds = @('oficina-k8s-deploy-expiration', 'oficina-k8s-deploy-delete-markers')
+
+function New-K8sDeployLifecycleRules {
+    # Duas regras porque ExpiredObjectDeleteMarker nao convive com Expiration
+    # na mesma regra.
+    return @(
+        [ordered]@{
+            ID     = 'oficina-k8s-deploy-expiration'
+            Status = 'Enabled'
+            Filter = [ordered]@{ Prefix = $K8sDeployPrefix }
+            Expiration = [ordered]@{ Days = 1 }
+            NoncurrentVersionExpiration = [ordered]@{ NoncurrentDays = 1 }
+            AbortIncompleteMultipartUpload = [ordered]@{ DaysAfterInitiation = 1 }
+        },
+        [ordered]@{
+            ID     = 'oficina-k8s-deploy-delete-markers'
+            Status = 'Enabled'
+            Filter = [ordered]@{ Prefix = $K8sDeployPrefix }
+            Expiration = [ordered]@{ ExpiredObjectDeleteMarker = $true }
+        }
+    )
+}
+
+function Get-LifecycleRules {
+    $result = Invoke-AwsCli -Arguments @(
+        's3api', 'get-bucket-lifecycle-configuration',
+        '--bucket', $BucketName,
+        '--output', 'json'
+    ) -AllowFailure
+
+    if ($result.ExitCode -ne 0) {
+        if ($result.Output -match 'NoSuchLifecycleConfiguration') { return @() }
+        throw "Nao foi possivel ler o lifecycle atual do bucket: $($result.Output)"
+    }
+
+    $json = ConvertFrom-JsonOutput -Text $result.Output
+    if ($null -eq $json -or $null -eq $json.Rules) { return @() }
+    return @($json.Rules)
+}
+
+function Set-K8sDeployLifecycle {
+    # put-bucket-lifecycle-configuration substitui a configuracao inteira do
+    # bucket. Enviar apenas as duas regras apagaria em silencio qualquer outra,
+    # inclusive regras do proprio Terraform State.
+    $existing = Get-LifecycleRules
+    $preserved = @($existing | Where-Object { $K8sDeployRuleIds -notcontains [string]$_.ID })
+    $preservedIds = @($preserved | ForEach-Object { [string]$_.ID })
+
+    $managed = New-K8sDeployLifecycleRules
+    foreach ($rule in $managed) {
+        $prefix = [string]$rule.Filter.Prefix
+        if ([string]::IsNullOrWhiteSpace($prefix) -or $prefix -cne $K8sDeployPrefix) {
+            throw "Regra '$($rule.ID)' sem prefixo exato '$K8sDeployPrefix'. Merge interrompido."
+        }
+    }
+
+    $payload = @{ Rules = @($preserved + $managed) }
+    $path = Write-JsonTempFile -Value $payload
+    try {
+        Invoke-AwsCli -Arguments @(
+            's3api', 'put-bucket-lifecycle-configuration',
+            '--bucket', $BucketName,
+            '--lifecycle-configuration', "file://$path"
+        ) | Out-Null
+    }
+    finally {
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    }
+
+    # A releitura e o que transforma "acreditamos que preservou" em evidencia.
+    $after = Get-LifecycleRules
+    $afterIds = @($after | ForEach-Object { [string]$_.ID })
+
+    foreach ($id in $preservedIds) {
+        if ($afterIds -notcontains $id) {
+            throw "Regra de lifecycle nao relacionada desapareceu apos o merge: $id"
+        }
+    }
+    foreach ($id in $K8sDeployRuleIds) {
+        if ($afterIds -notcontains $id) {
+            throw "Regra de lifecycle esperada ausente apos o merge: $id"
+        }
+    }
+    foreach ($rule in $after | Where-Object { $K8sDeployRuleIds -contains [string]$_.ID }) {
+        $prefix = [string]$rule.Filter.Prefix
+        if ($prefix -cne $K8sDeployPrefix) {
+            throw "Regra '$($rule.ID)' aplicada com prefixo '$prefix', diferente de '$K8sDeployPrefix'."
+        }
+    }
+
+    Write-Host "Lifecycle reconciliado. Regras preservadas: $($preservedIds.Count). Regras gerenciadas: $($K8sDeployRuleIds -join ', ')."
+}
+
 function Set-SecureTransportPolicy {
     $policy = @{
         Version   = '2012-10-17'
@@ -241,6 +338,7 @@ if ($DryRun) {
         Write-Host "Criacao planejada: regiao $Region com LocationConstraint=$Region"
     }
     Write-Host "Configuracoes planejadas: versionamento, SSE-S3 AES256, public access block, ownership, tags e politica SecureTransport."
+    Write-Host "Lifecycle planejado (merge preservando regras existentes): $($K8sDeployRuleIds -join ', ') no prefixo $K8sDeployPrefix."
     Write-Host "Status final: DRY_RUN_OK"
     exit 0
 }
@@ -274,10 +372,12 @@ Set-PublicAccessBlock
 Set-OwnershipControls
 Set-RequiredTags
 Set-SecureTransportPolicy
+Set-K8sDeployLifecycle
 
 Write-Host "Bucket: $BucketName"
 Write-Host "Regiao: $Region"
 Write-Host "Account ID: $accountId"
 Write-Host "ARN do bucket: arn:aws:s3:::$BucketName"
 Write-Host "Configuracoes aplicadas: versionamento Enabled, SSE-S3 AES256, Public Access Block total, BucketOwnerEnforced, tags obrigatorias, SecureTransport deny."
+Write-Host "Lifecycle aplicado: $($K8sDeployRuleIds -join ', ') restritos ao prefixo $K8sDeployPrefix, com regras pre-existentes preservadas."
 Write-Host "Status final: OK"

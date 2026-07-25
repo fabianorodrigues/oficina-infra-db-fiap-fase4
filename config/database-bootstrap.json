@@ -1,20 +1,23 @@
 {
   "version": 1,
-  "taskFamily": "oficina-db-bootstrap",
+  "jobName": "oficina-db-bootstrap",
   "containerName": "db-bootstrap",
   "rds": {
     "endpointParameter": "/oficina/infra/rds/endpoint",
     "portParameter": "/oficina/infra/rds/port",
     "masterSecretArnParameter": "/oficina/infra/rds/master-secret-arn"
   },
-  "ecs": {
-    "clusterNameParameter": "/oficina/infra/cluster/name",
-    "privateSubnet1Parameter": "/oficina/infra/subnets/private/1",
-    "privateSubnet2Parameter": "/oficina/infra/subnets/private/2",
-    "taskSecurityGroupParameter": "/oficina/infra/ecs/task-security-group-id",
+  "kubernetes": {
+    "namespaceParameter": "/oficina/infra/k8s/namespace",
+    "instanceIdParameter": "/oficina/infra/k8s/instance-id",
     "imageRepositoryParameter": "/oficina/infra/ecr/db-bootstrap",
-    "cpu": "512",
-    "memory": "1024"
+    "bootstrapManifest": "k8s/db-bootstrap-job.yaml",
+    "adminProvisionManifest": "k8s/admin-provision-job.yaml",
+    "isolationManifest": "k8s/db-isolation-job.yaml",
+    "cpuRequest": "100m",
+    "memoryRequest": "256Mi",
+    "cpuLimit": "500m",
+    "memoryLimit": "512Mi"
   },
   "secrets": {
     "cadastroRuntime": "/oficina/cadastro/runtime-db",
@@ -47,7 +50,7 @@
       "readOnlyLogins": []
     }
   ],
-  "runTask": {
+  "job": {
     "startedBy": "database-bootstrap",
     "timeoutSeconds": 900
   }

@@ -1,0 +1,67 @@
+# Bootstrap estrutural dos bancos, executado como Job no cluster K3s.
+# Os marcadores delimitados por sublinhados duplos sao substituidos dentro da EC2,
+# antes do apply.
+# O Secret referenciado e criado no host a partir do Secrets Manager e removido
+# no bloco finally do comando SSM: nenhum valor secreto passa pelo runner.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oficina-db-bootstrap-__RUN_ID__
+  namespace: oficina
+  labels:
+    app.kubernetes.io/name: oficina-db-bootstrap
+    app.kubernetes.io/component: database-bootstrap
+    app.kubernetes.io/part-of: oficina
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oficina-db-bootstrap
+        app.kubernetes.io/component: database-bootstrap
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: db-bootstrap
+          image: __BOOTSTRAP_IMAGE__
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: AWS_REGION
+              value: "__AWS_REGION__"
+            - name: RDS_HOST
+              value: "__RDS_HOST__"
+            - name: RDS_PORT
+              value: "__RDS_PORT__"
+            - name: WORK_DIR
+              value: /work
+          envFrom:
+            - secretRef:
+                name: oficina-db-bootstrap-credentials
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # O SQL renderizado com as senhas nunca toca o disco.
+        - name: work
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi

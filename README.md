@@ -26,12 +26,12 @@ Fundação da solução **Oficina**: rede, banco de dados relacional, segredos d
 
 ## Visão geral
 
-A **Oficina** é uma plataforma de gestão de oficina mecânica implantada na AWS e distribuída em **6 repositórios** que compõem um único sistema. O cliente acessa uma **API Gateway HTTP**, que autentica na borda por uma **Lambda authorizer** e encaminha o tráfego, via **VPC Link**, para um **ALB interno** que roteia para três microsserviços **.NET 10 em ECS Fargate**. Os serviços se comunicam por HTTP interno e por filas **SQS FIFO**, e persistem em um **RDS SQL Server** compartilhado.
+A **Oficina** é uma plataforma de gestão de oficina mecânica implantada na AWS e distribuída em **6 repositórios** que compõem um único sistema. O cliente acessa uma **API Gateway HTTP**, que autentica na borda por uma **Lambda authorizer** e encaminha o tráfego, via **VPC Link**, para um **ALB interno** que roteia para três microsserviços **.NET 10 em Kubernetes (K3s)**. Os serviços se comunicam por HTTP interno e por filas **SQS FIFO**, e persistem em um **RDS SQL Server** compartilhado.
 
 | Repositório | Responsabilidade | Etapas |
 |---|---|:---:|
 | **oficina-infra-db** *(este)* | Rede, banco de dados, segredos e estado do Terraform | 1 e 3 |
-| [oficina-infra](https://github.com/fabianorodrigues/oficina-infra-fiap-fase4) | Plataforma ECS/ALB e entrada de API | 2 e 8 |
+| [oficina-infra](https://github.com/fabianorodrigues/oficina-infra-fiap-fase4) | Plataforma Kubernetes/ALB e entrada de API | 2 e 8 |
 | [oficina-auth-lambda](https://github.com/fabianorodrigues/oficina-auth-lambda-fiap-fase4) | Autenticação por CPF e validação de token | 4 |
 | [oficina-cadastro](https://github.com/fabianorodrigues/oficina-cadastro-fiap-fase4) | Clientes, veículos, funcionários e catálogo de serviços | 5 |
 | [oficina-estoque](https://github.com/fabianorodrigues/oficina-estoque-fiap-fase4) | Peças, insumos, saldos e reservas | 6 |
@@ -60,7 +60,7 @@ Os repositórios têm dependências reais entre si. Esta é a sequência obrigat
 As etapas 5, 6 e 7 não dependem entre si e podem rodar em paralelo; a numeração indica a ordem recomendada. Após a etapa 8, o workflow **Observability Validate** (oficina-infra) está disponível como validação **opcional** e somente leitura.
 
 > [!IMPORTANT]
-> **Este repositório abre e retoma a sequência.** A **etapa 1** cria o bucket S3 de estado usado por todos os stacks — sem ela, os deploys de plataforma, autenticação e entrada abortam na verificação do bucket. A **etapa 3** (bootstrap) roda como *ECS Run Task* e depende do cluster ECS e do repositório de imagem criados na etapa 2, por isso não é adjacente à etapa 1.
+> **Este repositório abre e retoma a sequência.** A **etapa 1** cria o bucket S3 de estado usado por todos os stacks — sem ela, os deploys de plataforma, autenticação e entrada abortam na verificação do bucket. A **etapa 3** (bootstrap) roda como *Job Kubernetes* e depende do cluster K3s e do repositório de imagem criados na etapa 2, por isso não é adjacente à etapa 1.
 
 ---
 
@@ -83,7 +83,7 @@ flowchart TB
         S3[("Bucket S3<br/>estado do Terraform")]
     end
 
-    Bootstrap["Database Bootstrap<br/>ECS Run Task · cria bancos, logins e permissões"]
+    Bootstrap["Database Bootstrap<br/>Job Kubernetes · cria bancos, logins e permissões"]
 
     VPC --> SSM
     VPC --> SM
@@ -103,7 +103,7 @@ O acoplamento entre repositórios é feito **por nome de parâmetro no SSM e no 
 
 ### Consome
 
-Nada. Este repositório é a raiz do grafo de dependências. O **Database Bootstrap** (etapa 3) é a única exceção: consome o cluster ECS, o grupo de segurança das tasks e o repositório de imagem `db-bootstrap` publicados pela plataforma na etapa 2.
+Nada. Este repositório é a raiz do grafo de dependências. O **Database Bootstrap** (etapa 3) é a única exceção: consome o node do cluster K3s, o namespace e o repositório de imagem `db-bootstrap` publicados pela plataforma na etapa 2.
 
 ### Publica
 
@@ -159,21 +159,20 @@ O `ADMIN_INICIAL_CPF` precisa ter exatamente 11 dígitos, sem pontuação, e o `
 |---|---|:---:|
 | `AWS_REGION` | Região de todos os recursos | **Sim** |
 | `SQL_TOOLS_IMAGE` | Imagem base com as ferramentas de linha de comando do SQL Server, usada pelo bootstrap. Exige tag ou digest explícito — `latest` é rejeitado | **Sim, para o bootstrap** |
-| `ECS_TASK_EXECUTION_ROLE_ARN` | Role de execução da task de bootstrap | **Sim, para o bootstrap** |
-| `ECS_TASK_ROLE_ARN` | Role de aplicação da task de bootstrap | **Sim, para o bootstrap** |
+| `INSTANCE_PROFILE_NAME` (em oficina-infra) | Role de execução da task de bootstrap | **Sim, para o bootstrap** |
+| `INSTANCE_PROFILE_NAME` (em oficina-infra) | Role de aplicação da task de bootstrap | **Sim, para o bootstrap** |
 | `TF_STATE_BUCKET` | Compatibilidade com um bucket de estado pré-existente | Não |
 
-### Papéis IAM das tasks ECS — não provisionados automaticamente
+### Papéis IAM das Jobs Kubernetes — não provisionados automaticamente
 
-O **Database Bootstrap** roda como task ECS Fargate e reutiliza duas roles IAM que **precisam existir antes da execução**. Nenhum workflow da solução cria essas roles. Configure `ECS_TASK_EXECUTION_ROLE_ARN` e `ECS_TASK_ROLE_ARN` como *Repository Variables* apontando para roles com:
+O **Database Bootstrap** roda como Job Kubernetes no cluster K3s, acionado por Systems Manager. Este repositório **não configura role alguma**: o Job usa a role do instance profile da EC2 do cluster, definida uma única vez em `oficina-infra` pela variável `INSTANCE_PROFILE_NAME`. Nenhum workflow da solução cria ou altera recursos IAM.
 
-| Variable | Trust | Permissões mínimas |
+| Onde | Variable | Permissões mínimas exigidas pelo bootstrap |
 |---|---|---|
-| `ECS_TASK_EXECUTION_ROLE_ARN` | `ecs-tasks.amazonaws.com` | `AmazonECSTaskExecutionRolePolicy` (pull no ECR e escrita de logs) e `secretsmanager:GetSecretValue` no segredo master do RDS e nos 7 segredos de banco |
-| `ECS_TASK_ROLE_ARN` | `ecs-tasks.amazonaws.com` | Nenhuma permissão específica é exigida pelo bootstrap; use uma role mínima com o trust correto |
+| oficina-infra | `INSTANCE_PROFILE_NAME` | Registro no Systems Manager, `ecr:GetAuthorizationToken` e pull da imagem de bootstrap, e `secretsmanager:GetSecretValue` no segredo master do RDS e nos 7 segredos de banco |
 
 > [!NOTE]
-> Essas duas variáveis são **as mesmas** usadas pelos deploys de cadastro, estoque e ordens. Crie o par de roles uma vez e reutilize nos quatro repositórios que executam tasks ECS.
+> As credenciais são lidas do Secrets Manager **dentro da EC2** e materializadas como Secret Kubernetes temporário, removido em bloco `finally` que roda em sucesso, falha e timeout. Nenhum valor secreto passa pelo runner do GitHub.
 
 Consulte o ARN de uma role existente com:
 
@@ -204,11 +203,11 @@ Duração típica: 15 a 25 minutos, dominada pela criação do RDS.
 
 ### Etapa 3 — Database Bootstrap
 
-Execute **apenas depois** do Platform Deploy (etapa 2), pois roda como task ECS Fargate no cluster criado por ele.
+Execute **apenas depois** do Platform Deploy (etapa 2), pois roda como task Kubernetes (K3s) no cluster criado por ele.
 
 **Actions → Database Bootstrap → Run workflow → `confirmation` = `BOOTSTRAP`**
 
-Constrói a imagem de bootstrap a partir de `SQL_TOOLS_IMAGE`, publica no ECR `db-bootstrap`, registra a *task definition*, executa `aws ecs run-task` em subnets privadas, aguarda a task encerrar e valida o código de saída. Cria os bancos, os logins e as permissões da matriz acima. É idempotente — reexecutar não duplica objetos. As senhas são injetadas como *secrets* da task e não aparecem nos logs.
+Constrói a imagem de bootstrap a partir de `SQL_TOOLS_IMAGE`, publica no ECR `db-bootstrap`, registra a *manifesto do Job*, executa `aws Job Kubernetes` em subnets privadas, aguarda a task encerrar e valida o código de saída. Cria os bancos, os logins e as permissões da matriz acima. É idempotente — reexecutar não duplica objetos. As senhas são injetadas como *secrets* da task e não aparecem nos logs.
 
 Deixe o input `provision_admin_user` em `false` nesta primeira execução.
 
@@ -234,7 +233,7 @@ Esse administrador é a credencial usada na **etapa 9**, na validação funciona
 | **Secrets Manager** | 7 segredos, cada um com uma versão `AWSCURRENT` |
 | **Parameter Store** | 10 parâmetros sob `/oficina/infra/` |
 | **S3** | Bucket de estado com versionamento e criptografia ativos |
-| **ECS → Tasks (após a etapa 3)** | Task `oficina-db-bootstrap` encerrada com código de saída 0 |
+| **Systems Manager → Run Command (após a etapa 3)** | Comandos de bootstrap e de isolamento com status `Success` |
 
 ### Pela AWS CLI
 
@@ -294,7 +293,7 @@ terraform validate
 
 **Etapa 2 — obrigatória.** Pré-condição: a etapa 1 concluída, com o bucket S3 de estado, a VPC e o RDS `Available`.
 
-**→ [oficina-infra](https://github.com/fabianorodrigues/oficina-infra-fiap-fase4)** — seção [Como executar → Etapa 2](https://github.com/fabianorodrigues/oficina-infra-fiap-fase4#etapa-2--platform-deploy). Provisiona o cluster ECS, o ALB interno, os repositórios de imagem e as filas.
+**→ [oficina-infra](https://github.com/fabianorodrigues/oficina-infra-fiap-fase4)** — seção [Como executar → Etapa 2](https://github.com/fabianorodrigues/oficina-infra-fiap-fase4#etapa-2--platform-deploy). Provisiona a EC2 com K3s, o ALB interno, os repositórios de imagem e as filas.
 
 Concluída a etapa 2, **retorne a este README**, seção [Como executar → Etapa 3](#etapa-3--database-bootstrap), para executar o **Database Bootstrap**.
 

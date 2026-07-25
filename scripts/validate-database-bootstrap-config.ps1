@@ -6,8 +6,8 @@
     Verifica a estrutura, a unicidade, os limites e a ausencia de dados
     sensiveis em config/database-bootstrap.json, e valida a consistencia com o
     contrato de sincronizacao config/database-secrets.json e com os metadados
-    necessarios para ECS Run Task. Nao acessa a AWS e nao le nenhum valor de
-    senha. Retorna exit code diferente de zero em qualquer erro.
+    necessarios para os Jobs Kubernetes. Nao acessa a AWS e nao le nenhum valor
+    de senha. Retorna exit code diferente de zero em qualquer erro.
 
 .PARAMETER ConfigPath
     Caminho do contrato de bootstrap. Padrao: config/database-bootstrap.json.
@@ -94,40 +94,56 @@ if (-not $jsonValid) {
     exit 1
 }
 
-$taskFamily = [string](Get-PropertyValue -Object $config -Name 'taskFamily')
+$jobName = [string](Get-PropertyValue -Object $config -Name 'jobName')
 $containerName = [string](Get-PropertyValue -Object $config -Name 'containerName')
-$taskFamilyValid = ($taskFamily -eq 'oficina-db-bootstrap')
-$containerNameValid = ($containerName -eq 'db-bootstrap')
-Add-Result "Task family" $taskFamily $taskFamilyValid
-Add-Result "Container name" $containerName $containerNameValid
+Add-Result "Job name" $jobName ($jobName -eq 'oficina-db-bootstrap')
+Add-Result "Container name" $containerName ($containerName -eq 'db-bootstrap')
+
+# O runtime anterior nao pode sobreviver no contrato.
+$hasRetiredBlocks = (Test-HasProperty -Object $config -Name 'ecs') -or (Test-HasProperty -Object $config -Name 'runTask') -or (Test-HasProperty -Object $config -Name 'taskFamily')
+Add-Result "Sem blocos do runtime anterior" $(if ($hasRetiredBlocks) { 'Presentes' } else { 'Ok' }) (-not $hasRetiredBlocks)
 
 $rds = Get-PropertyValue -Object $config -Name 'rds'
-$ecs = Get-PropertyValue -Object $config -Name 'ecs'
+$k8s = Get-PropertyValue -Object $config -Name 'kubernetes'
 $ssmParams = @(
     [string](Get-PropertyValue -Object $rds -Name 'endpointParameter'),
     [string](Get-PropertyValue -Object $rds -Name 'portParameter'),
     [string](Get-PropertyValue -Object $rds -Name 'masterSecretArnParameter'),
-    [string](Get-PropertyValue -Object $ecs -Name 'clusterNameParameter'),
-    [string](Get-PropertyValue -Object $ecs -Name 'privateSubnet1Parameter'),
-    [string](Get-PropertyValue -Object $ecs -Name 'privateSubnet2Parameter'),
-    [string](Get-PropertyValue -Object $ecs -Name 'taskSecurityGroupParameter'),
-    [string](Get-PropertyValue -Object $ecs -Name 'imageRepositoryParameter')
+    [string](Get-PropertyValue -Object $k8s -Name 'namespaceParameter'),
+    [string](Get-PropertyValue -Object $k8s -Name 'instanceIdParameter'),
+    [string](Get-PropertyValue -Object $k8s -Name 'imageRepositoryParameter')
 )
 $allParamsScoped = (@($ssmParams | Where-Object { [string]::IsNullOrWhiteSpace($_) -or -not $_.StartsWith('/oficina/') }).Count -eq 0)
 Add-Result "Parametros SSM em /oficina/" $(if ($allParamsScoped) { 'Sim' } else { 'Nao' }) $allParamsScoped
 
-# Confere os paths RDS publicados pelo stack infra-db.
+# Confere os paths publicados pelas stacks infra-db e platform.
 Add-Result "endpointParameter" $ssmParams[0] ($ssmParams[0] -eq '/oficina/infra/rds/endpoint')
 Add-Result "portParameter" $ssmParams[1] ($ssmParams[1] -eq '/oficina/infra/rds/port')
 Add-Result "masterSecretArnParameter" $ssmParams[2] ($ssmParams[2] -eq '/oficina/infra/rds/master-secret-arn')
-Add-Result "clusterNameParameter" $ssmParams[3] ($ssmParams[3] -eq '/oficina/infra/cluster/name')
-Add-Result "taskSecurityGroupParameter" $ssmParams[6] ($ssmParams[6] -eq '/oficina/infra/ecs/task-security-group-id')
-Add-Result "imageRepositoryParameter" $ssmParams[7] ($ssmParams[7] -eq '/oficina/infra/ecr/db-bootstrap')
+Add-Result "namespaceParameter" $ssmParams[3] ($ssmParams[3] -eq '/oficina/infra/k8s/namespace')
+Add-Result "instanceIdParameter" $ssmParams[4] ($ssmParams[4] -eq '/oficina/infra/k8s/instance-id')
+Add-Result "imageRepositoryParameter" $ssmParams[5] ($ssmParams[5] -eq '/oficina/infra/ecr/db-bootstrap')
 
-$cpu = [string](Get-PropertyValue -Object $ecs -Name 'cpu')
-$memory = [string](Get-PropertyValue -Object $ecs -Name 'memory')
-Add-Result "CPU Fargate valida" $cpu (@('256', '512', '1024', '2048', '4096') -contains $cpu)
-Add-Result "Memoria Fargate valida" $memory (-not [string]::IsNullOrWhiteSpace($memory))
+# Os tres manifests precisam existir no repositorio: um caminho quebrado so
+# apareceria no meio do deploy remoto.
+$manifestKeys = @('bootstrapManifest', 'adminProvisionManifest', 'isolationManifest')
+$manifestPaths = @()
+foreach ($key in $manifestKeys) {
+    $manifestPath = [string](Get-PropertyValue -Object $k8s -Name $key)
+    $manifestPaths += $manifestPath
+    $exists = (-not [string]::IsNullOrWhiteSpace($manifestPath)) -and (Test-Path -LiteralPath $manifestPath -PathType Leaf)
+    Add-Result "Manifest $key" $manifestPath $exists
+}
+Add-Result "Manifests unicos" $(if (Test-Unique -Values $manifestPaths) { 'Sim' } else { 'Nao' }) (Test-Unique -Values $manifestPaths)
+
+$cpuRequest = [string](Get-PropertyValue -Object $k8s -Name 'cpuRequest')
+$memoryRequest = [string](Get-PropertyValue -Object $k8s -Name 'memoryRequest')
+$cpuLimit = [string](Get-PropertyValue -Object $k8s -Name 'cpuLimit')
+$memoryLimit = [string](Get-PropertyValue -Object $k8s -Name 'memoryLimit')
+Add-Result "CPU request" $cpuRequest ($cpuRequest -match '^\d+m?$')
+Add-Result "Memoria request" $memoryRequest ($memoryRequest -match '^\d+(Mi|Gi)$')
+Add-Result "CPU limit" $cpuLimit ($cpuLimit -match '^\d+m?$')
+Add-Result "Memoria limit" $memoryLimit ($memoryLimit -match '^\d+(Mi|Gi)$')
 
 $secrets = Get-PropertyValue -Object $config -Name 'secrets'
 $secretPaths = @()
@@ -178,9 +194,9 @@ foreach ($e in $expected) {
     Add-Result "Login $($e.Login) ($($e.Role)) em $($e.Database)" $(if ($ok) { 'OK' } else { 'Divergente' }) $ok
 }
 
-$runTask = Get-PropertyValue -Object $config -Name 'runTask'
-$startedBy = [string](Get-PropertyValue -Object $runTask -Name 'startedBy')
-$timeout = [int](Get-PropertyValue -Object $runTask -Name 'timeoutSeconds')
+$job = Get-PropertyValue -Object $config -Name 'job'
+$startedBy = [string](Get-PropertyValue -Object $job -Name 'startedBy')
+$timeout = [int](Get-PropertyValue -Object $job -Name 'timeoutSeconds')
 Add-Result "startedBy database-bootstrap" $startedBy ($startedBy -eq 'database-bootstrap')
 Add-Result "timeoutSeconds > 0" "$timeout" ($timeout -gt 0)
 

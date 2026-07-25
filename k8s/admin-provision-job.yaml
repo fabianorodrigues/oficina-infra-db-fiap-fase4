@@ -1,0 +1,67 @@
+# Provisiona a linha unica do Admin inicial em dbo.Funcionarios.
+# A senha em claro nunca sai do runner: somente o hash PBKDF2 chega ao cluster,
+# e chega por Secret temporario criado dentro da EC2, nunca por parametro do
+# Run Command.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oficina-admin-provision-__RUN_ID__
+  namespace: oficina
+  labels:
+    app.kubernetes.io/name: oficina-admin-provision
+    app.kubernetes.io/component: database-bootstrap
+    app.kubernetes.io/part-of: oficina
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oficina-admin-provision
+        app.kubernetes.io/component: database-bootstrap
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: admin-provision
+          image: __BOOTSTRAP_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command:
+            - /opt/bootstrap/provision-admin-user.sh
+          env:
+            - name: AWS_REGION
+              value: "__AWS_REGION__"
+            - name: RDS_HOST
+              value: "__RDS_HOST__"
+            - name: RDS_PORT
+              value: "__RDS_PORT__"
+            - name: WORK_DIR
+              value: /work
+          envFrom:
+            - secretRef:
+                name: oficina-admin-provision-credentials
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: work
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
