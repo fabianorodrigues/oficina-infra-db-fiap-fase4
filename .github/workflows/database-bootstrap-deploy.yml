@@ -7,6 +7,14 @@ on:
         description: Type BOOTSTRAP to initialize the databases.
         required: true
         type: string
+      provision_admin_user:
+        description: >-
+          Provision the initial Admin user from the ADMIN_INICIAL_CPF and
+          ADMIN_INICIAL_PASSWORD secrets. Requires the Cadastro migrations to
+          have been applied (table dbo.Funcionarios must already exist).
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -249,4 +257,253 @@ jobs:
           foreach ($d in $dbs) { $lines += "- $d" }
           $lines += ''
           $lines += 'Sensitive values were injected as ECS secrets and were not printed.'
+          ($lines -join "`n") | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+  provision-admin:
+    name: Provision initial Admin user
+    needs: bootstrap
+    if: ${{ inputs.provision_admin_user }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECS_TASK_EXECUTION_ROLE_ARN: ${{ vars.ECS_TASK_EXECUTION_ROLE_ARN }}
+      ECS_TASK_ROLE_ARN: ${{ vars.ECS_TASK_ROLE_ARN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate request and derive password hash
+        shell: pwsh
+        env:
+          ADMIN_INICIAL_CPF: ${{ secrets.ADMIN_INICIAL_CPF }}
+          ADMIN_INICIAL_PASSWORD: ${{ secrets.ADMIN_INICIAL_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REF -ne 'refs/heads/main') {
+            throw 'This workflow must run from main.'
+          }
+          foreach ($name in @('AWS_REGION', 'ECS_TASK_EXECUTION_ROLE_ARN', 'ECS_TASK_ROLE_ARN')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Repository Variable $name is required."
+            }
+          }
+
+          # O job so provisiona o usuario e a senha que estiverem nos Secrets.
+          # Nada e derivado de outra fonte e nenhuma outra escrita e feita.
+          $cpf = $env:ADMIN_INICIAL_CPF
+          $senha = $env:ADMIN_INICIAL_PASSWORD
+          if ([string]::IsNullOrWhiteSpace($cpf)) {
+            throw 'Secret ADMIN_INICIAL_CPF is required when provision_admin_user is true.'
+          }
+          if ([string]::IsNullOrWhiteSpace($senha)) {
+            throw 'Secret ADMIN_INICIAL_PASSWORD is required when provision_admin_user is true.'
+          }
+          if ($cpf -match '[\r\n\x00]' -or $senha -match '[\r\n\x00]') {
+            throw 'Admin secrets must not contain CR, LF or NUL.'
+          }
+          if ($senha.Length -gt 256) {
+            throw 'ADMIN_INICIAL_PASSWORD exceeds the 256 character limit accepted by the auth Lambda.'
+          }
+
+          # CPF com 11 digitos e digitos verificadores validos: o Lambda de auth
+          # recusa qualquer CPF que nao passe nessa checagem.
+          if ($cpf -notmatch '^\d{11}$') {
+            throw 'ADMIN_INICIAL_CPF must contain exactly 11 digits, without punctuation.'
+          }
+          $d = @($cpf.ToCharArray() | ForEach-Object { [int]::Parse($_) })
+          if (($d | Select-Object -Unique).Count -eq 1) {
+            throw 'ADMIN_INICIAL_CPF is invalid (all digits are the same).'
+          }
+          $soma = 0
+          for ($i = 0; $i -lt 9; $i++) { $soma += $d[$i] * (10 - $i) }
+          $dv1 = ($soma * 10) % 11
+          if ($dv1 -eq 10) { $dv1 = 0 }
+          $soma = 0
+          for ($i = 0; $i -lt 10; $i++) { $soma += $d[$i] * (11 - $i) }
+          $dv2 = ($soma * 10) % 11
+          if ($dv2 -eq 10) { $dv2 = 0 }
+          if ($dv1 -ne $d[9] -or $dv2 -ne $d[10]) {
+            throw 'ADMIN_INICIAL_CPF has invalid check digits.'
+          }
+
+          # Hash PBKDF2 derivado no runner: a senha em claro nunca sai daqui.
+          # O formato precisa acompanhar PasswordHashService.cs do Cadastro e o
+          # minimo de 100000 iteracoes exigido por Pbkdf2PasswordVerifier.cs.
+          $iteracoes = 100000
+          $salt = [System.Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
+          $derivado = [System.Security.Cryptography.Rfc2898DeriveBytes]::Pbkdf2(
+            $senha, $salt, $iteracoes, [System.Security.Cryptography.HashAlgorithmName]::SHA256, 32)
+          $hash = 'PBKDF2-SHA256$' + $iteracoes + '$' + [Convert]::ToBase64String($salt) + '$' + [Convert]::ToBase64String($derivado)
+          Write-Host "::add-mask::$hash"
+
+          "ADMIN_CPF=$cpf" | Add-Content -Path $env:GITHUB_ENV
+          "ADMIN_NOME=Admin Inicial Oficina" | Add-Content -Path $env:GITHUB_ENV
+          "ADMIN_SENHA_HASH=$hash" | Add-Content -Path $env:GITHUB_ENV
+          Write-Host 'Admin secrets validated and password hash derived. No sensitive value was printed.'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Validate AWS identity
+        shell: pwsh
+        run: aws sts get-caller-identity
+
+      - name: Resolve AWS metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Get-Ssm([string]$name) {
+            $v = aws ssm get-parameter --name $name --region $env:AWS_REGION --query 'Parameter.Value' --output text
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($v) -or $v -eq 'None') {
+              throw "Missing or empty SSM parameter: $name"
+            }
+            return $v.Trim()
+          }
+          function Get-SecretArn([string]$id) {
+            $v = aws secretsmanager describe-secret --secret-id $id --region $env:AWS_REGION --query 'ARN' --output text
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($v) -or $v -eq 'None') {
+              throw "Secret not found: $id"
+            }
+            return $v.Trim()
+          }
+
+          $config = Get-Content -LiteralPath 'config/database-bootstrap.json' -Raw | ConvertFrom-Json
+          $clusterName = Get-Ssm $config.ecs.clusterNameParameter
+          $subnet1 = Get-Ssm $config.ecs.privateSubnet1Parameter
+          $subnet2 = Get-Ssm $config.ecs.privateSubnet2Parameter
+          $securityGroup = Get-Ssm $config.ecs.taskSecurityGroupParameter
+          $repository = Get-Ssm $config.ecs.imageRepositoryParameter
+          $rdsHost = Get-Ssm $config.rds.endpointParameter
+          $rdsPort = Get-Ssm $config.rds.portParameter
+          $masterArn = Get-SecretArn $config.rds.masterSecretArnParameter
+
+          if ($rdsPort -notmatch '^\d+$') { throw "Invalid RDS port in SSM: $rdsPort" }
+
+          "CLUSTER_NAME=$clusterName" | Add-Content -Path $env:GITHUB_ENV
+          "PRIVATE_SUBNET_1=$subnet1" | Add-Content -Path $env:GITHUB_ENV
+          "PRIVATE_SUBNET_2=$subnet2" | Add-Content -Path $env:GITHUB_ENV
+          "TASK_SECURITY_GROUP_ID=$securityGroup" | Add-Content -Path $env:GITHUB_ENV
+          # Reusa a imagem ja construida e publicada pelo job bootstrap deste mesmo run.
+          "BOOTSTRAP_IMAGE=${repository}:$env:GITHUB_SHA" | Add-Content -Path $env:GITHUB_ENV
+          "RDS_HOST=$rdsHost" | Add-Content -Path $env:GITHUB_ENV
+          "RDS_PORT=$rdsPort" | Add-Content -Path $env:GITHUB_ENV
+          "MASTER_SECRET_ARN=$masterArn" | Add-Content -Path $env:GITHUB_ENV
+
+          $runTaskTimeout = [int]($config.runTask.timeoutSeconds)
+          if ($runTaskTimeout -le 0) { $runTaskTimeout = 900 }
+          "RUN_TASK_TIMEOUT_SECONDS=$runTaskTimeout" | Add-Content -Path $env:GITHUB_ENV
+          Write-Host 'Resolved ECS, RDS, ECR and master secret metadata.'
+
+      - name: Register task definition
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $container = @{
+            name = 'admin-provision'
+            image = $env:BOOTSTRAP_IMAGE
+            essential = $true
+            command = @('/opt/bootstrap/provision-admin-user.sh')
+            environment = @(
+              @{ name = 'AWS_REGION'; value = $env:AWS_REGION },
+              @{ name = 'RDS_HOST'; value = $env:RDS_HOST },
+              @{ name = 'RDS_PORT'; value = $env:RDS_PORT },
+              @{ name = 'ADMIN_CPF'; value = $env:ADMIN_CPF },
+              @{ name = 'ADMIN_NOME'; value = $env:ADMIN_NOME },
+              # Somente o hash PBKDF2 trafega. A senha em claro fica no runner.
+              @{ name = 'ADMIN_SENHA_HASH'; value = $env:ADMIN_SENHA_HASH }
+            )
+            secrets = @(
+              @{ name = 'MASTER_USERNAME'; valueFrom = "$($env:MASTER_SECRET_ARN):username::" },
+              @{ name = 'MASTER_PASSWORD'; valueFrom = "$($env:MASTER_SECRET_ARN):password::" }
+            )
+            logConfiguration = @{
+              logDriver = 'awslogs'
+              options = @{
+                'awslogs-group' = '/ecs/oficina/db-bootstrap'
+                'awslogs-region' = $env:AWS_REGION
+                'awslogs-stream-prefix' = 'provision-admin'
+              }
+            }
+          }
+          $taskDefinition = @{
+            family = 'oficina-admin-provision'
+            networkMode = 'awsvpc'
+            requiresCompatibilities = @('FARGATE')
+            cpu = '512'
+            memory = '1024'
+            executionRoleArn = $env:ECS_TASK_EXECUTION_ROLE_ARN
+            taskRoleArn = $env:ECS_TASK_ROLE_ARN
+            containerDefinitions = @($container)
+          }
+          $path = Join-Path $env:RUNNER_TEMP 'admin-provision-taskdef.json'
+          $taskDefinition | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $path -Encoding utf8
+          $arn = aws ecs register-task-definition --cli-input-json "file://$path" --region $env:AWS_REGION --query 'taskDefinition.taskDefinitionArn' --output text
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($arn)) { throw 'Failed to register admin provisioning task definition.' }
+          "ADMIN_TASK_DEFINITION_ARN=$arn" | Add-Content -Path $env:GITHUB_ENV
+
+      - name: Run admin provisioning task
+        shell: bash
+        run: |
+          set -euo pipefail
+          task_arn=$(aws ecs run-task \
+            --cluster "$CLUSTER_NAME" \
+            --launch-type FARGATE \
+            --started-by provision-admin \
+            --task-definition "$ADMIN_TASK_DEFINITION_ARN" \
+            --network-configuration "awsvpcConfiguration={subnets=[$PRIVATE_SUBNET_1,$PRIVATE_SUBNET_2],securityGroups=[$TASK_SECURITY_GROUP_ID],assignPublicIp=DISABLED}" \
+            --region "$AWS_REGION" \
+            --query 'tasks[0].taskArn' \
+            --output text)
+          if [ -z "$task_arn" ] || [ "$task_arn" = "None" ]; then
+            echo "ECS run-task did not return a task ARN." >&2
+            exit 1
+          fi
+          echo "ADMIN_TASK_ARN=$task_arn" >> "$GITHUB_ENV"
+          timeout_seconds="${RUN_TASK_TIMEOUT_SECONDS:-900}"
+          deadline=$(( $(date +%s) + timeout_seconds ))
+          while true; do
+            last_status=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query 'tasks[0].lastStatus' --output text)
+            if [ "$last_status" = "STOPPED" ]; then
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "Admin provisioning task did not stop within ${timeout_seconds}s (last status: ${last_status})." >&2
+              exit 1
+            fi
+            sleep 15
+          done
+          exit_code=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query "tasks[0].containers[?name==\`admin-provision\`].exitCode | [0]" --output text)
+          stopped_reason=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$task_arn" --region "$AWS_REGION" --query 'tasks[0].stoppedReason' --output text)
+          echo "Task stopped: $stopped_reason"
+          if [ "$exit_code" != "0" ]; then
+            echo "Admin provisioning task failed with exit code $exit_code." >&2
+            echo "Check the /ecs/oficina/db-bootstrap log group, stream prefix provision-admin." >&2
+            exit 1
+          fi
+
+      - name: Publish summary
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lines = @()
+          $lines += '## Initial Admin provisioning'
+          $lines += ''
+          $lines += "Cluster: $env:CLUSTER_NAME"
+          $lines += "Task definition: $env:ADMIN_TASK_DEFINITION_ARN"
+          $lines += "Task: $env:ADMIN_TASK_ARN"
+          $lines += "Image: $env:BOOTSTRAP_IMAGE"
+          $lines += ''
+          $lines += 'Scope: a single row in OficinaCadastroDb.dbo.Funcionarios, matching ADMIN_INICIAL_CPF.'
+          $lines += 'No database, login, user, role or permission was created or changed by this job.'
+          $lines += 'The plaintext password never left the runner: only the PBKDF2 hash was sent to the task.'
+          $lines += ''
+          $lines += 'Use these credentials as loginCpf and loginPassword in the Postman environment'
+          $lines += 'oficina-main-flow of the oficina-ordens-servico repository.'
           ($lines -join "`n") | Add-Content -Path $env:GITHUB_STEP_SUMMARY
