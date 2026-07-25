@@ -1,18 +1,12 @@
--- =============================================================================
--- provision-admin-user.sql
--- -----------------------------------------------------------------------------
 -- Provisiona EXCLUSIVAMENTE o usuario Admin inicial da Oficina em
 -- OficinaCadastroDb.dbo.Funcionarios, a partir do CPF e da senha guardados nos
 -- GitHub Secrets ADMIN_INICIAL_CPF e ADMIN_INICIAL_PASSWORD.
--- =============================================================================
 
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
 GO
 
--- -----------------------------------------------------------------------------
--- 0. Guarda: o banco de cadastro precisa existir (bootstrap ja executado).
--- -----------------------------------------------------------------------------
+-- Guarda: o banco de cadastro precisa existir (bootstrap ja executado).
 IF DB_ID(N'OficinaCadastroDb') IS NULL
 BEGIN
     RAISERROR('provision-admin-user: OficinaCadastroDb nao existe. Rode o bootstrap dos bancos antes.', 16, 1);
@@ -23,9 +17,7 @@ GO
 USE [OficinaCadastroDb];
 GO
 
--- -----------------------------------------------------------------------------
--- 1. Guarda: a tabela funcional precisa existir (migrations do Cadastro aplicadas).
--- -----------------------------------------------------------------------------
+-- Guarda: a tabela funcional precisa existir (migrations do Cadastro aplicadas).
 IF OBJECT_ID(N'dbo.Funcionarios', N'U') IS NULL
 BEGIN
     RAISERROR('provision-admin-user: dbo.Funcionarios nao existe. Aplique as migrations do Cadastro primeiro.', 16, 1);
@@ -33,9 +25,7 @@ BEGIN
 END
 GO
 
--- -----------------------------------------------------------------------------
--- 2. Validacao dos valores injetados e provisionamento do unico registro alvo.
--- -----------------------------------------------------------------------------
+-- Validacao dos valores injetados e provisionamento do unico registro alvo.
 DECLARE @Cpf         nvarchar(11)  = N'$(ADMIN_CPF_SQL)';
 DECLARE @Nome        nvarchar(150) = N'$(ADMIN_NOME_SQL)';
 DECLARE @SenhaHash   nvarchar(500) = N'$(ADMIN_SENHA_HASH_SQL)';
@@ -117,9 +107,7 @@ END
 COMMIT TRANSACTION;
 GO
 
--- -----------------------------------------------------------------------------
--- 3. Verificacao read-only: exatamente um Admin ativo com o CPF alvo.
--- -----------------------------------------------------------------------------
+-- Verificacao read-only: exatamente um Admin ativo com o CPF alvo.
 DECLARE @CpfConferencia nvarchar(11) = N'$(ADMIN_CPF_SQL)';
 DECLARE @Confirmados int;
 

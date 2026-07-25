@@ -34,7 +34,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-# Contrato canonico dos sete destinos, herdado das Etapas 5 a 7. Sem valores sensiveis.
+# Contrato canonico dos sete destinos de banco, sem valores sensiveis:
 # (login, chave em secrets{}, path do secret, banco, papel)
 $expected = @(
     [pscustomobject]@{ Login = 'cadastro_app';       SecretKey = 'cadastroRuntime';   Secret = '/oficina/cadastro/runtime-db';   Database = 'OficinaCadastroDb';        Role = 'runtime' }
@@ -75,7 +75,6 @@ function Test-Unique {
     return (@($Values | Sort-Object -Unique).Count -eq $Values.Count)
 }
 
-# 1. Arquivo e JSON validos.
 $fileExists = Test-Path -LiteralPath $ConfigPath -PathType Leaf
 Add-Result "Contrato de bootstrap existe" $ConfigPath $fileExists
 if (-not $fileExists) {
@@ -95,7 +94,6 @@ if (-not $jsonValid) {
     exit 1
 }
 
-# 2. Identidade da task.
 $taskFamily = [string](Get-PropertyValue -Object $config -Name 'taskFamily')
 $containerName = [string](Get-PropertyValue -Object $config -Name 'containerName')
 $taskFamilyValid = ($taskFamily -eq 'oficina-db-bootstrap')
@@ -103,7 +101,6 @@ $containerNameValid = ($containerName -eq 'db-bootstrap')
 Add-Result "Task family" $taskFamily $taskFamilyValid
 Add-Result "Container name" $containerName $containerNameValid
 
-# 3. Parametros RDS/ECS em /oficina/.
 $rds = Get-PropertyValue -Object $config -Name 'rds'
 $ecs = Get-PropertyValue -Object $config -Name 'ecs'
 $ssmParams = @(
@@ -119,7 +116,7 @@ $ssmParams = @(
 $allParamsScoped = (@($ssmParams | Where-Object { [string]::IsNullOrWhiteSpace($_) -or -not $_.StartsWith('/oficina/') }).Count -eq 0)
 Add-Result "Parametros SSM em /oficina/" $(if ($allParamsScoped) { 'Sim' } else { 'Nao' }) $allParamsScoped
 
-# Confere os paths RDS reais da Infra DB (Etapa 5).
+# Confere os paths RDS publicados pelo stack infra-db.
 Add-Result "endpointParameter" $ssmParams[0] ($ssmParams[0] -eq '/oficina/infra/rds/endpoint')
 Add-Result "portParameter" $ssmParams[1] ($ssmParams[1] -eq '/oficina/infra/rds/port')
 Add-Result "masterSecretArnParameter" $ssmParams[2] ($ssmParams[2] -eq '/oficina/infra/rds/master-secret-arn')
@@ -132,7 +129,6 @@ $memory = [string](Get-PropertyValue -Object $ecs -Name 'memory')
 Add-Result "CPU Fargate valida" $cpu (@('256', '512', '1024', '2048', '4096') -contains $cpu)
 Add-Result "Memoria Fargate valida" $memory (-not [string]::IsNullOrWhiteSpace($memory))
 
-# 5. Secrets: sete paths, unicos, escopados.
 $secrets = Get-PropertyValue -Object $config -Name 'secrets'
 $secretPaths = @()
 if ($null -ne $secrets) { $secretPaths = @($secrets.PSObject.Properties | ForEach-Object { [string]$_.Value }) }
@@ -147,13 +143,12 @@ foreach ($e in $expected) {
     Add-Result "secrets.$($e.SecretKey)" $(if ($actual -eq $e.Secret) { $actual } else { 'Divergente/ausente' }) ($actual -eq $e.Secret)
 }
 
-# 6. Databases: tres, unicos, com logins corretos.
+# Databases: tres, unicos, com logins corretos.
 $databases = @(Get-PropertyValue -Object $config -Name 'databases')
 Add-Result "Tres bancos" "$($databases.Count)" ($databases.Count -eq 3)
 $dbNames = @($databases | ForEach-Object { [string](Get-PropertyValue -Object $_ -Name 'name') })
 Add-Result "Bancos unicos" $(if (Test-Unique -Values $dbNames) { 'Sim' } else { 'Nao' }) (Test-Unique -Values $dbNames)
 
-# Coleta de todos os logins declarados.
 $allLogins = [System.Collections.Generic.List[string]]::new()
 foreach ($db in $databases) {
     $rl = [string](Get-PropertyValue -Object $db -Name 'runtimeLogin')
@@ -183,14 +178,13 @@ foreach ($e in $expected) {
     Add-Result "Login $($e.Login) ($($e.Role)) em $($e.Database)" $(if ($ok) { 'OK' } else { 'Divergente' }) $ok
 }
 
-# 7. Limites de execucao do Run Task.
 $runTask = Get-PropertyValue -Object $config -Name 'runTask'
 $startedBy = [string](Get-PropertyValue -Object $runTask -Name 'startedBy')
 $timeout = [int](Get-PropertyValue -Object $runTask -Name 'timeoutSeconds')
 Add-Result "startedBy database-bootstrap" $startedBy ($startedBy -eq 'database-bootstrap')
 Add-Result "timeoutSeconds > 0" "$timeout" ($timeout -gt 0)
 
-# 8. Ausencia de dados sensiveis e de referencias proibidas no arquivo.
+# Ausencia de dados sensiveis e de referencias proibidas no arquivo.
 # Padroes concatenados para nao dispararem sobre si mesmos.
 $forbidden = @(
     @{ Name = 'Senha embutida';            Pattern = '(?i)"' + 'password"\s*:\s*"' },
@@ -209,23 +203,21 @@ foreach ($entry in $forbidden) {
 }
 Add-Result "Sem dados sensiveis" $(if ($sensitiveFindings.Count -eq 0) { 'Ok' } else { 'Presentes' }) ($sensitiveFindings.Count -eq 0)
 
-$phaseThree = 'fase' + '-?' + '3'
 $envPatterns = @(
     @{ Name = 'ambiente dev';     Pattern = [regex]::Escape('/' + 'dev' + '/') },
     @{ Name = 'ambiente hml';     Pattern = [regex]::Escape('/' + 'hml' + '/') },
     @{ Name = 'ambiente prod';    Pattern = [regex]::Escape('/' + 'prod' + '/') },
     @{ Name = 'sufixo -dev';      Pattern = '(?<![A-Za-z0-9])-' + 'dev' + '(?![A-Za-z0-9])' },
     @{ Name = 'sufixo -hml';      Pattern = '(?<![A-Za-z0-9])-' + 'hml' + '(?![A-Za-z0-9])' },
-    @{ Name = 'sufixo -prod';     Pattern = '(?<![A-Za-z0-9])-' + 'prod' + '(?![A-Za-z0-9])' },
-    @{ Name = 'referencia Fase 3'; Pattern = "(?i)\b$phaseThree\b" }
+    @{ Name = 'sufixo -prod';     Pattern = '(?<![A-Za-z0-9])-' + 'prod' + '(?![A-Za-z0-9])' }
 )
 $envFindings = [System.Collections.Generic.List[string]]::new()
 foreach ($entry in $envPatterns) {
     if ($rawContent -match $entry.Pattern) { $envFindings.Add($entry.Name) | Out-Null }
 }
-Add-Result "Sem ambiente/Fase 3" $(if ($envFindings.Count -eq 0) { 'Ok' } else { 'Divergente' }) ($envFindings.Count -eq 0)
+Add-Result "Sem referencia a ambiente" $(if ($envFindings.Count -eq 0) { 'Ok' } else { 'Divergente' }) ($envFindings.Count -eq 0)
 
-# 9. Consistencia com config/database-secrets.json.
+# Consistencia com config/database-secrets.json.
 $secretsFileExists = Test-Path -LiteralPath $SecretsConfigPath -PathType Leaf
 Add-Result "Contrato de secrets existe" $SecretsConfigPath $secretsFileExists
 if ($secretsFileExists) {
@@ -265,7 +257,6 @@ if ($secretsFileExists) {
     Add-Result "Port param coerente" $syncPort ($syncPort -eq $ssmParams[1])
 }
 
-# 10. Imagem do bootstrap.
 $dockerfileExists = Test-Path -LiteralPath $DockerfilePath -PathType Leaf
 Add-Result "Dockerfile bootstrap existe" $DockerfilePath $dockerfileExists
 

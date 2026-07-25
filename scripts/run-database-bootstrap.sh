@@ -1,23 +1,17 @@
 #!/usr/bin/env bash
-# =============================================================================
-# run-database-bootstrap.sh
-# -----------------------------------------------------------------------------
 # Executado dentro de uma ECS Run Task. Le a identidade master e as sete senhas
-# funcionais a partir de variaveis de ambiente injetadas pelo ECS a partir do
-# Secrets Manager, renderiza o SQL de bootstrap em um arquivo temporario em RAM,
-# conecta ao RDS SQL Server com conexao criptografada e executa o bootstrap e a
-# validacao idempotentes.
+# funcionais de variaveis de ambiente injetadas pelo ECS a partir do Secrets
+# Manager, renderiza o SQL de bootstrap em arquivo temporario, conecta ao RDS
+# SQL Server com conexao criptografada e executa bootstrap e validacao
+# idempotentes.
 #
 # Regras de seguranca:
 #   * nunca imprime senhas, connection strings, payloads ou o SQL renderizado;
 #   * nunca usa 'set -x';
-#   * a senha master vai por SQLCMDPASSWORD (variavel de ambiente do sqlcmd),
-#     nunca por -P na linha de comando;
+#   * a senha master vai por SQLCMDPASSWORD, nunca por -P na linha de comando;
 #   * as sete senhas funcionais entram no SQL como literais T-SQL ja escapados,
 #     nunca como argumentos de linha de comando;
-#   * o SQL renderizado vive apenas em emptyDir (RAM), com permissao 600, e e
-#     removido no encerramento.
-# =============================================================================
+#   * o SQL renderizado tem permissao 600 e e destruido no encerramento.
 
 # Os marcadores de senha ($(..._PASSWORD_SQL)) sao strings literais propositais,
 # substituidas por literais T-SQL antes do sqlcmd. Nao devem expandir no shell.
@@ -25,9 +19,6 @@
 
 set -euo pipefail
 
-# -----------------------------------------------------------------------------
-# Configuracao (nao sensivel). Sobrescrevivel por variavel de ambiente.
-# -----------------------------------------------------------------------------
 SCRIPTS_DIR="${SCRIPTS_DIR:-/opt/bootstrap/scripts}"
 WORK_DIR="${WORK_DIR:-/work}"
 SQL_ENCRYPT_TRUST_SERVER_CERT="${SQL_ENCRYPT_TRUST_SERVER_CERT:-true}"
@@ -38,9 +29,6 @@ RENDERED_SQL="${WORK_DIR}/bootstrap-databases.rendered.sql"
 log() { printf '%s %s\n' "[db-bootstrap]" "$*"; }
 fail() { printf '%s %s\n' "[db-bootstrap][ERRO]" "$*" >&2; exit 1; }
 
-# -----------------------------------------------------------------------------
-# Limpeza garantida de artefatos e segredos em memoria.
-# -----------------------------------------------------------------------------
 cleanup() {
     local status=$?
     if [ -f "$RENDERED_SQL" ]; then
@@ -55,9 +43,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# -----------------------------------------------------------------------------
-# Localiza o binario sqlcmd (imagem mssql-tools18 ou PATH).
-# -----------------------------------------------------------------------------
 SQLCMD=""
 for candidate in \
     "${SQLCMD_PATH:-}" \
@@ -70,19 +55,13 @@ if [ -z "$SQLCMD" ] && command -v sqlcmd >/dev/null 2>&1; then
 fi
 [ -n "$SQLCMD" ] || fail "sqlcmd nao encontrado na imagem."
 
-# -----------------------------------------------------------------------------
-# 1. Endpoint e porta (nao sensiveis) chegam por variavel de ambiente do Job.
-# -----------------------------------------------------------------------------
 [ -n "${RDS_HOST:-}" ] || fail "RDS_HOST ausente."
 [ -n "${RDS_PORT:-}" ] || fail "RDS_PORT ausente."
 case "$RDS_PORT" in
     ''|*[!0-9]*) fail "RDS_PORT invalido." ;;
 esac
 
-# -----------------------------------------------------------------------------
-# 2. Leitura segura de variavel de ambiente ou arquivo local opcional,
-#    rejeitando CR, LF e NUL. O valor jamais e impresso.
-# -----------------------------------------------------------------------------
+# Rejeita CR, LF e NUL no valor lido. O valor jamais e impresso.
 read_secret_value() {
     local env_name="$1"
     local fallback_file="${2:-}"
@@ -118,9 +97,6 @@ ORDENS_APP_RAW="$(read_secret_value ORDENS_APP_PASSWORD "${SECRETS_DIR:-}/ordens
 ORDENS_MIGRATOR_RAW="$(read_secret_value ORDENS_MIGRATOR_PASSWORD "${SECRETS_DIR:-}/ordens-migrator-password" 'ordens-migrator-password')"
 AUTH_READ_RAW="$(read_secret_value AUTH_READ_PASSWORD "${SECRETS_DIR:-}/auth-read-password" 'auth-read-password')"
 
-# -----------------------------------------------------------------------------
-# 3. Escape T-SQL das sete senhas funcionais.
-# -----------------------------------------------------------------------------
 CADASTRO_APP_SQL="$(escape_tsql "$CADASTRO_APP_RAW")"
 CADASTRO_MIGRATOR_SQL="$(escape_tsql "$CADASTRO_MIGRATOR_RAW")"
 ESTOQUE_APP_SQL="$(escape_tsql "$ESTOQUE_APP_RAW")"
@@ -133,9 +109,6 @@ AUTH_READ_SQL="$(escape_tsql "$AUTH_READ_RAW")"
 unset CADASTRO_APP_RAW CADASTRO_MIGRATOR_RAW ESTOQUE_APP_RAW ESTOQUE_MIGRATOR_RAW \
       ORDENS_APP_RAW ORDENS_MIGRATOR_RAW AUTH_READ_RAW
 
-# -----------------------------------------------------------------------------
-# 4. Renderizacao do SQL em memoria (substituicao literal, sem regex/sed).
-# -----------------------------------------------------------------------------
 BOOTSTRAP_TEMPLATE="${SCRIPTS_DIR}/bootstrap-databases.sql"
 VALIDATE_SQL="${SCRIPTS_DIR}/validate-databases.sql"
 [ -f "$BOOTSTRAP_TEMPLATE" ] || fail "Script ausente: bootstrap-databases.sql"
@@ -151,6 +124,7 @@ t_ordens_app='$(ORDENS_APP_PASSWORD_SQL)'
 t_ordens_migrator='$(ORDENS_MIGRATOR_PASSWORD_SQL)'
 t_auth_read='$(AUTH_READ_PASSWORD_SQL)'
 
+# Substituicao literal, sem regex nem sed, para nao reinterpretar a senha.
 rendered="${rendered//"$t_cadastro_app"/$CADASTRO_APP_SQL}"
 rendered="${rendered//"$t_cadastro_migrator"/$CADASTRO_MIGRATOR_SQL}"
 rendered="${rendered//"$t_estoque_app"/$ESTOQUE_APP_SQL}"
@@ -168,7 +142,6 @@ for token in \
     esac
 done
 
-# Libera os literais escapados apos a renderizacao.
 unset CADASTRO_APP_SQL CADASTRO_MIGRATOR_SQL ESTOQUE_APP_SQL ESTOQUE_MIGRATOR_SQL \
       ORDENS_APP_SQL ORDENS_MIGRATOR_SQL AUTH_READ_SQL
 
@@ -176,11 +149,9 @@ mkdir -p "$WORK_DIR"
 ( umask 077; printf '%s' "$rendered" > "$RENDERED_SQL" )
 chmod 600 "$RENDERED_SQL" 2>/dev/null || true
 unset rendered
-log "SQL de bootstrap renderizado em arquivo temporario (RAM)."
+log "SQL de bootstrap renderizado em arquivo temporario restrito."
 
-# -----------------------------------------------------------------------------
-# 5. Argumentos de conexao. Conexao sempre criptografada (-N).
-# -----------------------------------------------------------------------------
+# -N mantem a conexao sempre criptografada.
 conn_args=(-S "tcp:${RDS_HOST},${RDS_PORT}" -U "$MASTER_USER" -d master -l "$LOGIN_TIMEOUT" -b -x -N)
 if [ "$SQL_ENCRYPT_TRUST_SERVER_CERT" = "true" ]; then
     conn_args+=(-C)
@@ -192,18 +163,12 @@ unset MASTER_PASSWORD
 
 log "Conectando ao RDS em ${RDS_HOST}:${RDS_PORT} como usuario master (senha via SQLCMDPASSWORD)."
 
-# -----------------------------------------------------------------------------
-# 6. Execucao do bootstrap idempotente.
-# -----------------------------------------------------------------------------
 log "Executando bootstrap-databases (rendered)..."
 if ! "$SQLCMD" "${conn_args[@]}" -i "$RENDERED_SQL"; then
     fail "Falha na execucao de bootstrap-databases."
 fi
 log "Bootstrap concluido."
 
-# -----------------------------------------------------------------------------
-# 7. Execucao da validacao read-only.
-# -----------------------------------------------------------------------------
 log "Executando validate-databases..."
 if ! "$SQLCMD" "${conn_args[@]}" -i "$VALIDATE_SQL"; then
     fail "Falha na validacao de bancos, logins, usuarios ou isolamento."

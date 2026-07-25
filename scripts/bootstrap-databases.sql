@@ -1,7 +1,4 @@
--- =============================================================================
--- bootstrap-databases.sql
--- -----------------------------------------------------------------------------
--- Bootstrap idempotente da stack de bancos SQL Server da Oficina (Fase 4).
+-- Bootstrap idempotente da stack de bancos SQL Server da Oficina.
 --
 -- Cria/atualiza, de forma repetivel:
 --   * 3 bancos: OficinaCadastroDb, OficinaEstoqueDb, OficinaOrdensServicoDb
@@ -24,15 +21,12 @@
 --
 -- Compativel com Amazon RDS for SQL Server: nao usa recursos que exijam
 -- sysadmin, acesso ao sistema operacional ou configuracao de instancia.
--- =============================================================================
 
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
 GO
 
--- -----------------------------------------------------------------------------
--- 0. Guarda: o bootstrap precisa rodar conectado ao banco master.
--- -----------------------------------------------------------------------------
+-- Guarda: o bootstrap precisa rodar conectado ao banco master.
 IF DB_NAME() <> N'master'
 BEGIN
     RAISERROR('bootstrap-databases: precisa estar conectado ao banco master.', 16, 1);
@@ -40,9 +34,7 @@ BEGIN
 END
 GO
 
--- -----------------------------------------------------------------------------
--- 1. Criacao idempotente dos tres bancos (cada CREATE DATABASE em seu batch).
--- -----------------------------------------------------------------------------
+-- Criacao idempotente dos tres bancos (cada CREATE DATABASE em seu batch).
 IF DB_ID(N'OficinaCadastroDb') IS NULL
     CREATE DATABASE [OficinaCadastroDb];
 GO
@@ -55,11 +47,9 @@ IF DB_ID(N'OficinaOrdensServicoDb') IS NULL
     CREATE DATABASE [OficinaOrdensServicoDb];
 GO
 
--- -----------------------------------------------------------------------------
--- 2. Criacao/atualizacao idempotente dos sete logins SQL.
---    Mantem a politica de senha padrao suportada pelo RDS (nao usa CHECK_POLICY
---    OFF). Nenhuma role de servidor ampla e concedida.
--- -----------------------------------------------------------------------------
+-- Criacao/atualizacao idempotente dos sete logins SQL.
+--   Mantem a politica de senha padrao suportada pelo RDS (nao usa CHECK_POLICY
+--   OFF). Nenhuma role de servidor ampla e concedida.
 IF SUSER_ID(N'cadastro_app') IS NULL
     CREATE LOGIN [cadastro_app] WITH PASSWORD = N'$(CADASTRO_APP_PASSWORD_SQL)';
 ELSE
@@ -109,15 +99,13 @@ ELSE
 ALTER LOGIN [auth_read] ENABLE;
 GO
 
--- =============================================================================
--- 3. OficinaCadastroDb: usuarios, permissoes e isolamento.
--- =============================================================================
+-- OficinaCadastroDb: usuarios, permissoes e isolamento.
 USE [OficinaCadastroDb];
 GO
 
--- 3.1 Isolamento: remove usuarios gerenciados que NAO pertencem a este banco.
---     So remove nomes da allowlist gerenciada, apenas usuarios SQL (type 'S'),
---     nunca usuarios de sistema, administrativos ou desconhecidos.
+-- Isolamento: remove usuarios gerenciados que NAO pertencem a este banco.
+--   So remove nomes da allowlist gerenciada, apenas usuarios SQL (type 'S'),
+--   nunca usuarios de sistema, administrativos ou desconhecidos.
 DECLARE @managed TABLE (name sysname PRIMARY KEY);
 INSERT INTO @managed (name) VALUES
     (N'cadastro_app'), (N'cadastro_migrator'), (N'auth_read'),
@@ -166,7 +154,7 @@ BEGIN
 END
 GO
 
--- 3.2 Runtime: cadastro_app -> leitura + escrita + EXECUTE (sem DDL).
+-- Runtime: cadastro_app -> leitura + escrita + EXECUTE (sem DDL).
 IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'cadastro_app' AND type = 'S')
     CREATE USER [cadastro_app] FOR LOGIN [cadastro_app];
 ELSE
@@ -176,7 +164,7 @@ IF IS_ROLEMEMBER('db_datawriter', 'cadastro_app') = 0 ALTER ROLE [db_datawriter]
 GRANT EXECUTE TO [cadastro_app];   -- compatibilidade com stored procedures (documentado)
 GO
 
--- 3.3 Migrator: cadastro_migrator -> DDL + leitura + escrita + EXECUTE.
+-- Migrator: cadastro_migrator -> DDL + leitura + escrita + EXECUTE.
 IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'cadastro_migrator' AND type = 'S')
     CREATE USER [cadastro_migrator] FOR LOGIN [cadastro_migrator];
 ELSE
@@ -187,7 +175,7 @@ IF IS_ROLEMEMBER('db_datawriter', 'cadastro_migrator') = 0 ALTER ROLE [db_datawr
 GRANT EXECUTE TO [cadastro_migrator];
 GO
 
--- 3.4 auth_read: somente leitura no Cadastro, via role dedicada auth_reader.
+-- auth_read: somente leitura no Cadastro, via role dedicada auth_reader.
 IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'auth_read' AND type = 'S')
     CREATE USER [auth_read] FOR LOGIN [auth_read];
 ELSE
@@ -207,9 +195,7 @@ ELSE IF IS_ROLEMEMBER('db_datareader', 'auth_reader') = 0
     ALTER ROLE [db_datareader] ADD MEMBER [auth_reader];
 GO
 
--- =============================================================================
--- 4. OficinaEstoqueDb: usuarios, permissoes e isolamento.
--- =============================================================================
+-- OficinaEstoqueDb: usuarios, permissoes e isolamento.
 USE [OficinaEstoqueDb];
 GO
 
@@ -279,9 +265,7 @@ IF IS_ROLEMEMBER('db_datawriter', 'estoque_migrator') = 0 ALTER ROLE [db_datawri
 GRANT EXECUTE TO [estoque_migrator];
 GO
 
--- =============================================================================
--- 5. OficinaOrdensServicoDb: usuarios, permissoes e isolamento.
--- =============================================================================
+-- OficinaOrdensServicoDb: usuarios, permissoes e isolamento.
 USE [OficinaOrdensServicoDb];
 GO
 
