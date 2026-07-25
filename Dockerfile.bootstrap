@@ -14,6 +14,6 @@ RUN chmod +x /opt/bootstrap/run-database-bootstrap.sh \
              /opt/bootstrap/validate-database-isolation.sh
 
 # Entrypoint padrao: bootstrap estrutural dos bancos.
-# Os jobs provision-admin e db-isolation sobrescrevem o command para
+# Os jobs Initial Admin Provision e db-isolation sobrescrevem o command para
 # /opt/bootstrap/provision-admin-user.sh e /opt/bootstrap/validate-database-isolation.sh.
 ENTRYPOINT ["/opt/bootstrap/run-database-bootstrap.sh"]

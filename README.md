@@ -30,7 +30,7 @@ A **Oficina** é uma plataforma de gestão de oficina mecânica implantada na AW
 
 | Repositório | Responsabilidade | Etapas |
 |---|---|:---:|
-| **oficina-infra-db** *(este)* | Rede, banco de dados, segredos e estado do Terraform | 1 e 3 |
+| **oficina-infra-db** *(este)* | Rede, banco de dados, segredos, estado do Terraform e admin inicial | 1, 3 e 5.1 |
 | [oficina-infra](https://github.com/fabianorodrigues/oficina-infra-fiap-fase4) | Plataforma Kubernetes/ALB e entrada de API | 2 e 8 |
 | [oficina-auth-lambda](https://github.com/fabianorodrigues/oficina-auth-lambda-fiap-fase4) | Autenticação por CPF e validação de token | 4 |
 | [oficina-cadastro](https://github.com/fabianorodrigues/oficina-cadastro-fiap-fase4) | Clientes, veículos, funcionários e catálogo de serviços | 5 |
@@ -49,18 +49,19 @@ Os repositórios têm dependências reais entre si. Esta é a sequência obrigat
 |:---:|---|---|:---:|
 | **1** | **oficina-infra-db** | **Database Infrastructure Deploy** | `APPLY` |
 | 2 | oficina-infra | Platform Deploy | `APPLY` |
-| **3** | **oficina-infra-db** | **Database Bootstrap** | `BOOTSTRAP` |
+| **3** | **oficina-infra-db** | **Database Bootstrap (estrutura)** | `BOOTSTRAP` |
 | 4 | oficina-auth-lambda | Auth Deploy | `DEPLOY` |
 | 5 | oficina-cadastro | Cadastro Deploy | `DEPLOY` |
+| **5.1** | **oficina-infra-db** | **Initial Admin Provision** | `PROVISION_ADMIN` |
 | 6 | oficina-estoque | Estoque Deploy | `DEPLOY` |
 | 7 | oficina-ordens-servico | Ordens Deploy | `DEPLOY` |
 | 8 | oficina-infra | Entrypoint Deploy | `APPLY` |
 | 9 | oficina-ordens-servico | Collection Postman (execução manual) | — |
 
-As etapas 5, 6 e 7 não dependem entre si e podem rodar em paralelo; a numeração indica a ordem recomendada. Após a etapa 8, o workflow **Observability Validate** (oficina-infra) está disponível como validação **opcional** e somente leitura.
+As etapas 6 e 7 não dependem do admin inicial e podem rodar em paralelo se desejado; a sequência acima é o caminho guiado para configuração completa. A etapa **5.1** é obrigatória no primeiro provisionamento do ambiente e opcional em redeploys do Cadastro quando o admin já existe. Ela precisa estar concluída antes da etapa 9. Após a etapa 8, o workflow **Observability Validate** (oficina-infra) está disponível como validação **opcional** e somente leitura.
 
 > [!IMPORTANT]
-> **Este repositório abre e retoma a sequência.** A **etapa 1** cria o bucket S3 de estado usado por todos os stacks — sem ela, os deploys de plataforma, autenticação e entrada abortam na verificação do bucket. A **etapa 3** (bootstrap) roda como *Job Kubernetes* e depende do cluster K3s e do repositório de imagem criados na etapa 2, por isso não é adjacente à etapa 1.
+> **Este repositório abre e retoma a sequência.** A **etapa 1** cria o bucket S3 de estado usado por todos os stacks — sem ela, os deploys de plataforma, autenticação e entrada abortam na verificação do bucket. A **etapa 3** (bootstrap estrutural) roda como *Job Kubernetes* e depende do cluster K3s e do repositório de imagem criados na etapa 2, por isso não é adjacente à etapa 1. A **etapa 5.1** usa um workflow separado para criar ou atualizar o administrador inicial somente depois que o Cadastro criou `OficinaCadastroDb.dbo.Funcionarios`.
 
 ---
 
@@ -147,7 +148,7 @@ Configure em **Settings → Secrets and variables → Actions** do repositório.
 | `SQL_ORDENS_APP_PASSWORD` · `SQL_ORDENS_MIGRATOR_PASSWORD` | Senhas dos logins do banco de ordens | **Sim** |
 | `SQL_AUTH_READ_PASSWORD` | Senha do login de leitura da autenticação | **Sim** |
 | `RDS_ADMIN_CIDR` | CIDR IPv4 (`/32`) autorizado a acessar a porta 1433 para administração via SSMS. Vazio mantém o RDS fechado | Não |
-| `ADMIN_INICIAL_CPF` · `ADMIN_INICIAL_PASSWORD` | Credenciais do usuário administrador inicial. Exigidas **apenas** quando o Database Bootstrap roda com `provision_admin_user = true` | **Sim, para provisionar o admin** |
+| `ADMIN_INICIAL_CPF` · `ADMIN_INICIAL_PASSWORD` | Credenciais do usuário administrador inicial. Exigidas **apenas** pelo workflow **Initial Admin Provision** (etapa 5.1) | **Sim, para provisionar o admin** |
 
 O deploy verifica a presença das 7 senhas antes de iniciar e falha listando as que faltarem. Use senhas que atendam à política do SQL Server (maiúscula, minúscula, dígito e no mínimo 8 caracteres).
 
@@ -158,18 +159,17 @@ O `ADMIN_INICIAL_CPF` precisa ter exatamente 11 dígitos, sem pontuação, e o `
 | Variable | Uso | Obrigatório |
 |---|---|:---:|
 | `AWS_REGION` | Região de todos os recursos | **Sim** |
-| `SQL_TOOLS_IMAGE` | Imagem base com as ferramentas de linha de comando do SQL Server, usada pelo bootstrap. Exige tag ou digest explícito — `latest` é rejeitado | **Sim, para o bootstrap** |
-| `INSTANCE_PROFILE_NAME` (em oficina-infra) | Role de execução da task de bootstrap | **Sim, para o bootstrap** |
-| `INSTANCE_PROFILE_NAME` (em oficina-infra) | Role de aplicação da task de bootstrap | **Sim, para o bootstrap** |
+| `SQL_TOOLS_IMAGE` | Imagem base com as ferramentas de linha de comando do SQL Server, usada pelo bootstrap e pelo provisionamento do admin. Exige tag ou digest explícito — `latest` é rejeitado | **Sim, para os Jobs de banco** |
+| `INSTANCE_PROFILE_NAME` (em oficina-infra) | Instance profile da EC2 do K3s usado pelos Jobs Kubernetes do bootstrap | **Sim, para o bootstrap** |
 | `TF_STATE_BUCKET` | Compatibilidade com um bucket de estado pré-existente | Não |
 
 ### Papéis IAM das Jobs Kubernetes — não provisionados automaticamente
 
-O **Database Bootstrap** roda como Job Kubernetes no cluster K3s, acionado por Systems Manager. Este repositório **não configura role alguma**: o Job usa a role do instance profile da EC2 do cluster, definida uma única vez em `oficina-infra` pela variável `INSTANCE_PROFILE_NAME`. Nenhum workflow da solução cria ou altera recursos IAM.
+O **Database Bootstrap** e o **Initial Admin Provision** rodam como Jobs Kubernetes no cluster K3s, acionados por Systems Manager. Este repositório **não configura role alguma**: os Jobs usam a role do instance profile da EC2 do cluster, definida uma única vez em `oficina-infra` pela variável `INSTANCE_PROFILE_NAME`. Nenhum workflow da solução cria ou altera recursos IAM.
 
-| Onde | Variable | Permissões mínimas exigidas pelo bootstrap |
+| Onde | Variable | Permissões mínimas exigidas pelos Jobs de banco |
 |---|---|---|
-| oficina-infra | `INSTANCE_PROFILE_NAME` | Registro no Systems Manager, `ecr:GetAuthorizationToken` e pull da imagem de bootstrap, e `secretsmanager:GetSecretValue` no segredo master do RDS e nos 7 segredos de banco |
+| oficina-infra | `INSTANCE_PROFILE_NAME` | Registro no Systems Manager, `ecr:GetAuthorizationToken` e pull da imagem `db-bootstrap`, `secretsmanager:GetSecretValue` no segredo master do RDS e nos 7 segredos de banco, e `ssm:GetParameter` com `kms:Decrypt` em `/oficina/deploy/*` para o hash temporário do admin |
 
 > [!NOTE]
 > As credenciais são lidas do Secrets Manager **dentro da EC2** e materializadas como Secret Kubernetes temporário, removido em bloco `finally` que roda em sucesso, falha e timeout. Nenhum valor secreto passa pelo runner do GitHub.
@@ -203,22 +203,28 @@ Duração típica: 15 a 25 minutos, dominada pela criação do RDS.
 
 ### Etapa 3 — Database Bootstrap
 
-Execute **apenas depois** do Platform Deploy (etapa 2), pois roda como task Kubernetes (K3s) no cluster criado por ele.
+Execute **apenas depois** do Platform Deploy (etapa 2), pois roda como Job Kubernetes (K3s) no cluster criado por ele.
 
 **Actions → Database Bootstrap → Run workflow → `confirmation` = `BOOTSTRAP`**
 
-Constrói a imagem de bootstrap a partir de `SQL_TOOLS_IMAGE`, publica no ECR `db-bootstrap`, registra a *manifesto do Job*, executa `aws Job Kubernetes` em subnets privadas, aguarda a task encerrar e valida o código de saída. Cria os bancos, os logins e as permissões da matriz acima. É idempotente — reexecutar não duplica objetos. As senhas são injetadas como *secrets* da task e não aparecem nos logs.
+Constrói a imagem de bootstrap a partir de `SQL_TOOLS_IMAGE`, publica no ECR `db-bootstrap`, aplica o manifesto do Job Kubernetes, executa o Job no namespace da solução, aguarda a conclusão e valida o código de saída. Cria os bancos, os logins e as permissões da matriz acima. É idempotente — reexecutar não duplica objetos. As senhas são injetadas como *secrets* do Job e não aparecem nos logs.
 
-Deixe o input `provision_admin_user` em `false` nesta primeira execução.
+Este workflow não cria usuários de aplicação. Nesse momento a tabela `dbo.Funcionarios` ainda não existe, porque ela é criada pelas migrations do Cadastro na etapa 5.
 
-### Usuário administrador inicial — segunda execução do bootstrap
+<a id="etapa-51-admin-inicial"></a>
 
-O mesmo workflow tem um job `provision-admin`, ativado pelo input **`provision_admin_user` = `true`**, que grava o administrador inicial na tabela `dbo.Funcionarios` do banco de cadastro.
+### Etapa 5.1 — Usuário administrador inicial
+
+Execute **apenas depois** do Cadastro Deploy (etapa 5), pois esse workflow grava o administrador inicial na tabela `dbo.Funcionarios` criada pelas migrations do Cadastro.
+
+**Actions → Initial Admin Provision → Run workflow → `confirmation` = `PROVISION_ADMIN`**
+
+O workflow constrói ou reutiliza a imagem `db-bootstrap`, deriva o hash PBKDF2 a partir de `ADMIN_INICIAL_PASSWORD`, envia apenas o hash como `SecureString` temporário e executa um Job Kubernetes restrito ao provisionamento de uma única linha em `OficinaCadastroDb.dbo.Funcionarios`.
 
 > [!IMPORTANT]
-> Esse job exige que **as migrations do Cadastro já estejam aplicadas**, ou seja, ele só funciona **depois da etapa 5**. Reexecute o **Database Bootstrap** com `confirmation` = `BOOTSTRAP` e `provision_admin_user` = `true` após publicar o oficina-cadastro. O job `bootstrap` roda novamente antes dele, sem efeito colateral por ser idempotente.
+> Esse workflow exige que **as migrations do Cadastro já estejam aplicadas**. Se `dbo.Funcionarios` não existir, ele falha com orientação para executar a etapa 5 primeiro. Se o admin já existir, ele atualiza nome, hash da senha, perfil Admin e status ativo, então pode ser usado para corrigir ou rotacionar a credencial inicial.
 
-Esse administrador é a credencial usada na **etapa 9**, na validação funcional pela collection Postman. Sem ele, não há como autenticar na API.
+Essa etapa é obrigatória no primeiro provisionamento do ambiente e opcional em redeploys normais do Cadastro quando o administrador já existe. Esse administrador é a credencial usada na **etapa 9**, na validação funcional pela collection Postman. Sem ele, não há como autenticar na API.
 
 ---
 
@@ -295,6 +301,6 @@ terraform validate
 
 **→ [oficina-infra](https://github.com/fabianorodrigues/oficina-infra-fiap-fase4)** — seção [Como executar → Etapa 2](https://github.com/fabianorodrigues/oficina-infra-fiap-fase4#etapa-2--platform-deploy). Provisiona a EC2 com K3s, o ALB interno, os repositórios de imagem e as filas.
 
-Concluída a etapa 2, **retorne a este README**, seção [Como executar → Etapa 3](#etapa-3--database-bootstrap), para executar o **Database Bootstrap**.
+Concluída a etapa 2, **retorne a este README**, seção [Como executar → Etapa 3](#etapa-3--database-bootstrap), para executar o **Database Bootstrap estrutural**.
 
-Depois da etapa 5, **retorne mais uma vez** a [Usuário administrador inicial](#usuário-administrador-inicial--segunda-execução-do-bootstrap) para provisionar o administrador exigido pela etapa 9.
+Depois da etapa 5, **retorne mais uma vez** a [Etapa 5.1 — Usuário administrador inicial](#etapa-51-admin-inicial) para provisionar o administrador exigido pela etapa 9.

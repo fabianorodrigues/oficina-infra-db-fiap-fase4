@@ -44,6 +44,16 @@ esac
 : "${RDS_PORT:?RDS_PORT ausente}"
 : "${JOB_TIMEOUT_SECONDS:?JOB_TIMEOUT_SECONDS ausente}"
 
+if [ "$SECRET_SOURCE" = "bootstrap" ] || [ "$SECRET_SOURCE" = "admin" ]; then
+    : "${MASTER_SECRET_ID:?MASTER_SECRET_ID ausente}"
+fi
+
+if [ "$SECRET_SOURCE" = "admin" ]; then
+    : "${HASH_PARAMETER:?HASH_PARAMETER ausente}"
+    : "${ADMIN_CPF:?ADMIN_CPF ausente}"
+    : "${ADMIN_NOME:?ADMIN_NOME ausente}"
+fi
+
 MAX_BYTES="${MAX_MANIFEST_BYTES:-30000}"
 
 [ -f "$MANIFEST" ] || { echo "Manifesto nao encontrado: $MANIFEST" >&2; exit 1; }

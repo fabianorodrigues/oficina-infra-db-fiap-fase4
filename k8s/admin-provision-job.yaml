@@ -1,7 +1,8 @@
 # Provisiona a linha unica do Admin inicial em dbo.Funcionarios.
 # A senha em claro nunca sai do runner: somente o hash PBKDF2 chega ao cluster,
 # e chega por Secret temporario criado dentro da EC2, nunca por parametro do
-# Run Command.
+# Run Command. Este Job e usado pelo workflow Initial Admin Provision, depois
+# que o Cadastro Deploy aplica as migrations.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -9,7 +10,7 @@ metadata:
   namespace: oficina
   labels:
     app.kubernetes.io/name: oficina-admin-provision
-    app.kubernetes.io/component: database-bootstrap
+    app.kubernetes.io/component: initial-admin-provision
     app.kubernetes.io/part-of: oficina
 spec:
   backoffLimit: 0
@@ -17,7 +18,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: oficina-admin-provision
-        app.kubernetes.io/component: database-bootstrap
+        app.kubernetes.io/component: initial-admin-provision
     spec:
       restartPolicy: Never
       containers:

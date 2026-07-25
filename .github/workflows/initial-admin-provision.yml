@@ -1,0 +1,266 @@
+name: Initial Admin Provision
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type PROVISION_ADMIN after Cadastro Deploy to create or refresh the initial Admin user.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: database-bootstrap
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  # Limite conservador para o corpo de um Run Command. Acima disso o comando e
+  # truncado em silencio, e truncamento silencioso e o modo de falha que este
+  # limite existe para impedir.
+  MAX_MANIFEST_BYTES: "30000"
+
+jobs:
+  provision-admin:
+    name: Provision initial Admin user after Cadastro migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SQL_TOOLS_IMAGE: ${{ vars.SQL_TOOLS_IMAGE }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Validate request and derive password hash
+        shell: pwsh
+        env:
+          ADMIN_INICIAL_CPF: ${{ secrets.ADMIN_INICIAL_CPF }}
+          ADMIN_INICIAL_PASSWORD: ${{ secrets.ADMIN_INICIAL_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REF -ne 'refs/heads/main') {
+            throw 'This workflow must run from main.'
+          }
+          if ('${{ inputs.confirmation }}' -cne 'PROVISION_ADMIN') {
+            throw 'Confirmation must be PROVISION_ADMIN.'
+          }
+          foreach ($name in @('AWS_REGION', 'SQL_TOOLS_IMAGE')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Repository Variable $name is required."
+            }
+          }
+          if ($env:SQL_TOOLS_IMAGE -notmatch ':' -or $env:SQL_TOOLS_IMAGE -match ':latest$') {
+            throw 'SQL_TOOLS_IMAGE must use an explicit tag or digest and never latest.'
+          }
+
+          # O job so provisiona o usuario e a senha que estiverem nos Secrets.
+          # Nada e derivado de outra fonte e nenhuma outra escrita e feita.
+          $cpf = $env:ADMIN_INICIAL_CPF
+          $senha = $env:ADMIN_INICIAL_PASSWORD
+          if ([string]::IsNullOrWhiteSpace($cpf)) {
+            throw 'Secret ADMIN_INICIAL_CPF is required for Initial Admin Provision.'
+          }
+          if ([string]::IsNullOrWhiteSpace($senha)) {
+            throw 'Secret ADMIN_INICIAL_PASSWORD is required for Initial Admin Provision.'
+          }
+          if ($cpf -match '[\r\n\x00]' -or $senha -match '[\r\n\x00]') {
+            throw 'Admin secrets must not contain CR, LF or NUL.'
+          }
+          if ($senha.Length -gt 256) {
+            throw 'ADMIN_INICIAL_PASSWORD exceeds the 256 character limit accepted by the auth Lambda.'
+          }
+
+          # CPF com 11 digitos e digitos verificadores validos: o Lambda de auth
+          # recusa qualquer CPF que nao passe nessa checagem.
+          if ($cpf -notmatch '^\d{11}$') {
+            throw 'ADMIN_INICIAL_CPF must contain exactly 11 digits, without punctuation.'
+          }
+          $d = @($cpf.ToCharArray() | ForEach-Object { [int]::Parse($_) })
+          if (($d | Select-Object -Unique).Count -eq 1) {
+            throw 'ADMIN_INICIAL_CPF is invalid (all digits are the same).'
+          }
+          $soma = 0
+          for ($i = 0; $i -lt 9; $i++) { $soma += $d[$i] * (10 - $i) }
+          $dv1 = ($soma * 10) % 11
+          if ($dv1 -eq 10) { $dv1 = 0 }
+          $soma = 0
+          for ($i = 0; $i -lt 10; $i++) { $soma += $d[$i] * (11 - $i) }
+          $dv2 = ($soma * 10) % 11
+          if ($dv2 -eq 10) { $dv2 = 0 }
+          if ($dv1 -ne $d[9] -or $dv2 -ne $d[10]) {
+            throw 'ADMIN_INICIAL_CPF has invalid check digits.'
+          }
+
+          # Hash PBKDF2 derivado no runner: a senha em claro nunca sai daqui.
+          # O formato precisa acompanhar PasswordHashService.cs do Cadastro e o
+          # minimo de 100000 iteracoes exigido por Pbkdf2PasswordVerifier.cs.
+          $iteracoes = 100000
+          $salt = [System.Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
+          $derivado = [System.Security.Cryptography.Rfc2898DeriveBytes]::Pbkdf2(
+            $senha, $salt, $iteracoes, [System.Security.Cryptography.HashAlgorithmName]::SHA256, 32)
+          $hash = 'PBKDF2-SHA256$' + $iteracoes + '$' + [Convert]::ToBase64String($salt) + '$' + [Convert]::ToBase64String($derivado)
+          Write-Host "::add-mask::$hash"
+
+          "ADMIN_CPF=$cpf" | Add-Content -Path $env:GITHUB_ENV
+          "ADMIN_NOME=Admin Inicial Oficina" | Add-Content -Path $env:GITHUB_ENV
+          "ADMIN_SENHA_HASH=$hash" | Add-Content -Path $env:GITHUB_ENV
+          Write-Host 'Admin secrets validated and password hash derived. No sensitive value was printed.'
+
+      - name: Validate contracts
+        shell: pwsh
+        run: |
+          ./scripts/validate-database-secrets-config.ps1 -ConfigPath config/database-secrets.json
+          ./scripts/validate-database-bootstrap-config.ps1 -ConfigPath config/database-bootstrap.json -SecretsConfigPath config/database-secrets.json
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Validate AWS identity
+        shell: pwsh
+        run: aws sts get-caller-identity
+
+      - name: Resolve cluster and database metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Get-Ssm([string]$name) {
+            $v = aws ssm get-parameter --name $name --region $env:AWS_REGION --query 'Parameter.Value' --output text
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($v) -or $v -eq 'None') {
+              throw "Missing or empty SSM parameter: $name"
+            }
+            return $v.Trim()
+          }
+
+          $config = Get-Content -LiteralPath 'config/database-bootstrap.json' -Raw | ConvertFrom-Json
+          $namespace = Get-Ssm $config.kubernetes.namespaceParameter
+          $instanceId = Get-Ssm $config.kubernetes.instanceIdParameter
+          $repository = Get-Ssm $config.kubernetes.imageRepositoryParameter
+          $rdsHost = Get-Ssm $config.rds.endpointParameter
+          $rdsPort = Get-Ssm $config.rds.portParameter
+          $masterSecret = Get-Ssm $config.rds.masterSecretArnParameter
+
+          if ($rdsPort -notmatch '^\d+$') { throw "Invalid RDS port in SSM: $rdsPort" }
+          if ($instanceId -notmatch '^i-[0-9a-f]+$') { throw 'Invalid Kubernetes node instance id in SSM.' }
+
+          $ping = aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$instanceId" --region $env:AWS_REGION --query 'InstanceInformationList[0].PingStatus' --output text
+          if ($ping -ne 'Online') { throw "Kubernetes node $instanceId is not Online in Systems Manager (status: $ping)." }
+
+          "K8S_NAMESPACE=$namespace" | Add-Content -Path $env:GITHUB_ENV
+          "K8S_INSTANCE_ID=$instanceId" | Add-Content -Path $env:GITHUB_ENV
+          "BOOTSTRAP_IMAGE=${repository}:$env:GITHUB_SHA" | Add-Content -Path $env:GITHUB_ENV
+          "RDS_HOST=$rdsHost" | Add-Content -Path $env:GITHUB_ENV
+          "RDS_PORT=$rdsPort" | Add-Content -Path $env:GITHUB_ENV
+          "MASTER_SECRET_ID=$masterSecret" | Add-Content -Path $env:GITHUB_ENV
+
+          $timeout = [int]($config.job.timeoutSeconds)
+          if ($timeout -le 0) { $timeout = 900 }
+          "JOB_TIMEOUT_SECONDS=$timeout" | Add-Content -Path $env:GITHUB_ENV
+          Write-Host 'Resolved Kubernetes, RDS and registry metadata.'
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push bootstrap image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_without_registry="${BOOTSTRAP_IMAGE#*/}"
+          repository_name="${image_without_registry%:*}"
+          image_tag="${BOOTSTRAP_IMAGE##*:}"
+
+          if aws ecr describe-images \
+            --repository-name "$repository_name" \
+            --image-ids imageTag="$image_tag" \
+            --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "Bootstrap image $repository_name:$image_tag already exists in ECR; reusing it for this rerun."
+            exit 0
+          fi
+
+          docker build --build-arg SQL_TOOLS_IMAGE="$SQL_TOOLS_IMAGE" -f Dockerfile.bootstrap -t "$BOOTSTRAP_IMAGE" .
+          docker push "$BOOTSTRAP_IMAGE"
+
+      - name: Stage the admin hash as a SecureString
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          parameter="/oficina/deploy/admin-provision/${GITHUB_RUN_ID}/senha-hash"
+
+          # ssm:DeleteParameter e pre-requisito obrigatorio. Sem ele o parametro
+          # nao e criado: sobrescrever nao apaga o valor, so acrescenta versao.
+          # Aqui nao ha fallback aceitavel, porque o unico caminho alternativo
+          # colocaria o hash no corpo do Run Command.
+          for action in ssm:PutParameter ssm:DeleteParameter ssm:GetParameter; do
+            decision=$(aws iam simulate-principal-policy \
+              --policy-source-arn "$(aws sts get-caller-identity --query Arn --output text)" \
+              --action-names "$action" \
+              --context-entries "ContextKeyName=aws:RequestedRegion,ContextKeyType=string,ContextKeyValues=$AWS_REGION" \
+              --query 'EvaluationResults[0].EvalDecision' --output text 2>/dev/null || echo unknown)
+            echo "$action -> $decision"
+            if [ "$decision" = "explicitDeny" ] || [ "$decision" = "implicitDeny" ]; then
+              echo "Permissao $action indisponivel. O provisionamento do Admin foi interrompido antes de criar qualquer parametro." >&2
+              exit 1
+            fi
+          done
+
+          umask 077
+          payload=$(mktemp)
+          trap 'rm -f "$payload"' EXIT
+          jq -n --arg n "$parameter" --arg v "$ADMIN_SENHA_HASH" \
+            '{Name: $n, Value: $v, Type: "SecureString", KeyId: "alias/aws/ssm", Overwrite: false}' > "$payload"
+          aws ssm put-parameter --cli-input-json "file://$payload" --region "$AWS_REGION" >/dev/null
+          echo "parameter=$parameter" >> "$GITHUB_OUTPUT"
+          echo "HASH_PARAMETER=$parameter" >> "$GITHUB_ENV"
+
+      - name: Run admin provisioning job
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/run-database-job.sh \
+            --manifest k8s/admin-provision-job.yaml \
+            --job-name "oficina-admin-provision-${GITHUB_RUN_ID}" \
+            --secret-name oficina-admin-provision-credentials \
+            --secret-source admin
+
+      - name: Remove the staged SecureString
+        if: always() && steps.stage.outputs.parameter != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ssm delete-parameter --name "${{ steps.stage.outputs.parameter }}" --region "$AWS_REGION" >/dev/null 2>&1 || true
+          if aws ssm get-parameter --name "${{ steps.stage.outputs.parameter }}" --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo 'O parametro temporario ainda existe apos a exclusao.' >&2
+            exit 1
+          fi
+          echo 'Parametro temporario removido.'
+
+      - name: Publish summary
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lines = @()
+          $lines += '## Initial Admin provisioning'
+          $lines += ''
+          $lines += 'Run this workflow after Cadastro Deploy has applied the migrations that create OficinaCadastroDb.dbo.Funcionarios.'
+          $lines += "Namespace: $env:K8S_NAMESPACE"
+          $lines += "Job: oficina-admin-provision-$env:GITHUB_RUN_ID"
+          $lines += "Image: $env:BOOTSTRAP_IMAGE"
+          $lines += ''
+          $lines += 'Scope: a single row in OficinaCadastroDb.dbo.Funcionarios, matching ADMIN_INICIAL_CPF.'
+          $lines += 'No database, SQL login, database user, role or permission was created or changed by this job.'
+          $lines += 'If the row already exists, the job refreshes name, password hash, Admin profile and active flag.'
+          $lines += 'The plaintext password never left the runner. Only the PBKDF2 hash was staged, as a'
+          $lines += 'SecureString whose name (never its value) travelled in the Run Command, and the'
+          $lines += 'parameter was deleted afterwards.'
+          $lines += ''
+          $lines += 'Use these credentials as loginCpf and loginPassword in the Postman environment'
+          $lines += 'oficina-main-flow of the oficina-ordens-servico repository.'
+          ($lines -join "`n") | Add-Content -Path $env:GITHUB_STEP_SUMMARY
