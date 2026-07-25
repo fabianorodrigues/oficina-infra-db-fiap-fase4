@@ -3,9 +3,13 @@ FROM ${SQL_TOOLS_IMAGE}
 
 WORKDIR /opt/bootstrap
 COPY scripts/run-database-bootstrap.sh /opt/bootstrap/run-database-bootstrap.sh
+COPY scripts/provision-admin-user.sh /opt/bootstrap/provision-admin-user.sh
 COPY scripts/bootstrap-databases.sql /opt/bootstrap/scripts/bootstrap-databases.sql
 COPY scripts/validate-databases.sql /opt/bootstrap/scripts/validate-databases.sql
+COPY scripts/provision-admin-user.sql /opt/bootstrap/scripts/provision-admin-user.sql
 
-RUN chmod +x /opt/bootstrap/run-database-bootstrap.sh
+RUN chmod +x /opt/bootstrap/run-database-bootstrap.sh /opt/bootstrap/provision-admin-user.sh
 
+# Entrypoint padrao: bootstrap estrutural dos bancos.
+# O job provision-admin sobrescreve o command para /opt/bootstrap/provision-admin-user.sh.
 ENTRYPOINT ["/opt/bootstrap/run-database-bootstrap.sh"]
