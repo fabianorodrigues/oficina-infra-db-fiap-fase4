@@ -127,6 +127,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          image_without_registry="${BOOTSTRAP_IMAGE#*/}"
+          repository_name="${image_without_registry%:*}"
+          image_tag="${BOOTSTRAP_IMAGE##*:}"
+
+          if aws ecr describe-images \
+            --repository-name "$repository_name" \
+            --image-ids imageTag="$image_tag" \
+            --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "Bootstrap image $repository_name:$image_tag already exists in ECR; reusing it for this rerun."
+            exit 0
+          fi
+
           docker build --build-arg SQL_TOOLS_IMAGE="$SQL_TOOLS_IMAGE" -f Dockerfile.bootstrap -t "$BOOTSTRAP_IMAGE" .
           docker push "$BOOTSTRAP_IMAGE"
 
