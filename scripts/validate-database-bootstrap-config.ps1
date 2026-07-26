@@ -17,6 +17,9 @@
 
 .PARAMETER DockerfilePath
     Dockerfile usado para publicar a imagem do bootstrap.
+
+.PARAMETER AdminProvisionSqlPath
+    Script SQL usado para criar ou atualizar o administrador inicial.
 #>
 
 [CmdletBinding()]
@@ -28,7 +31,10 @@ param(
     [string]$SecretsConfigPath = "config/database-secrets.json",
 
     [Parameter(Mandatory = $false)]
-    [string]$DockerfilePath = "Dockerfile.bootstrap"
+    [string]$DockerfilePath = "Dockerfile.bootstrap",
+
+    [Parameter(Mandatory = $false)]
+    [string]$AdminProvisionSqlPath = "scripts/provision-admin-user.sql"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -275,6 +281,27 @@ if ($secretsFileExists) {
 
 $dockerfileExists = Test-Path -LiteralPath $DockerfilePath -PathType Leaf
 Add-Result "Dockerfile bootstrap existe" $DockerfilePath $dockerfileExists
+
+$adminSqlExists = Test-Path -LiteralPath $AdminProvisionSqlPath -PathType Leaf
+Add-Result "SQL admin provision existe" $AdminProvisionSqlPath $adminSqlExists
+if ($adminSqlExists) {
+    $adminSql = Get-Content -LiteralPath $AdminProvisionSqlPath -Raw
+    $requiredSetOptions = @(
+        [pscustomobject]@{ Name = 'ANSI_NULLS'; Value = 'ON' },
+        [pscustomobject]@{ Name = 'ANSI_PADDING'; Value = 'ON' },
+        [pscustomobject]@{ Name = 'ANSI_WARNINGS'; Value = 'ON' },
+        [pscustomobject]@{ Name = 'ARITHABORT'; Value = 'ON' },
+        [pscustomobject]@{ Name = 'CONCAT_NULL_YIELDS_NULL'; Value = 'ON' },
+        [pscustomobject]@{ Name = 'QUOTED_IDENTIFIER'; Value = 'ON' },
+        [pscustomobject]@{ Name = 'NUMERIC_ROUNDABORT'; Value = 'OFF' }
+    )
+
+    foreach ($option in $requiredSetOptions) {
+        $pattern = "(?im)^\s*SET\s+$($option.Name)\s+$($option.Value)\s*;"
+        $hasOption = $adminSql -match $pattern
+        Add-Result "Admin SQL SET $($option.Name)" $option.Value $hasOption
+    }
+}
 
 $checks | Format-Table -AutoSize
 
